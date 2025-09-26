@@ -12,6 +12,11 @@ from random import choice, uniform, randint
 from asyncio import sleep
 import os, json, requests
 
+from random import choice, uniform, randint
+from asyncio import sleep
+import os, json
+from discord.ext.commands import command
+
 import os
 import json
 import asyncio
@@ -151,69 +156,73 @@ class Eco(Cog):
         server = ctx.channel.name
         base_url = f"https://{server}.e-sim.org/"
         file_name = f"auctions_prices_{server}.json"
-    
+
+        # Αν δεν υπάρχει αρχείο τιμών, τρέχουμε τη διαδικασία δημιουργίας
         if file_name not in os.listdir():
             return await ctx.invoke(self.bot.get_command("set_auctions_prices"), nick=nick)
-    
-        with open(file_name, "r", encoding="utf-8") as file:
-            prices = json.load(file)
-    
+        else:
+            with open(file_name, "r", encoding="utf-8") as file:
+                prices = json.load(file)
+
         await ctx.send(f"**{nick}** Ok. You can cancel with `.cancel bid_all_auctions {nick}`")
-    
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-            "Accept": "text/html,application/xhtml+xml,application/xml",
-            "Accept-Language": "en-US,en;q=0.5",
-            "Referer": base_url,
-            "Connection": "keep-alive",
-        }
-    
+
+        page = 1
         while not utils.should_break(ctx):
-            # Παίρνουμε τη σελίδα auctions χωρίς pagination
-            tree = await self.bot.get_content(f"{base_url}auctions.html", return_tree=True)
-        
+            url = (
+                f"{base_url}auctionsOffers?"
+                f"status=IN_PROGRESS&"
+                f"type=null&"
+                f"equipmentSorting=TIME&"
+                f"page={page}&"
+                f"selectedAuctionType_ANY=true&"
+                f"selectedAuctionStatus_IN_PROGRESS=true&"
+                f"selectedAuctionEquipmentSorting_TIME=true"
+            )
+
+            tree = await self.bot.get_content(url, return_tree=True)
+
+            # Επιλογή κουμπιών και στοιχείων
             buttons = tree.xpath("//*[@class='auctionButtons']/button[last()]")
             items = tree.xpath("//*[@class='auctionItem']//img[last()]//@src")
             current_prices = tree.xpath("//*[@class='auctionBidder']//b/text()")
-        
-            if not buttons:
-                await ctx.send(f"**{nick}** Δεν υπάρχουν auctions.")
+
+            if not buttons:  # Δεν υπάρχουν άλλα auctions
                 break
-        
+
             results = []
             for item, price, button in zip(items, current_prices, buttons):
                 item = item.split("/")[-1].split(".png")[0].replace("-", "_").replace("bandage_", "bandage")
                 if item.count("_") == 1:
                     item = item.split("_")[0]
-                elif item.count("_") == 2:  # eq_reshuffle_big.png
+                elif item.count("_") == 2:
                     item = item.split("_")[1].split("-")[0]
-            
+
                 auction_id = button.attrib['data-id']
                 min_bid = button.attrib['data-minimal-outbid']
                 buyer = button.attrib['data-top-bidder'].lower()
-            
+
                 price = str(prices.get(item, "0")) or "0"
                 price = choice(price.split(","))
                 if "-" in price:
                     min_price, max_price = price.split("-")
                     price = round(uniform(float(min_price), float(max_price)), 2)
-            
+
                 if float(min_bid) > float(price) or buyer in ([nick.lower()] + self.bot.friends.get(server, [])):
                     continue
-            
                 if utils.should_break(ctx):
                     break
-            
+
                 payload = {'action': "BID", 'id': auction_id, 'price': price}
-                await self.bot.get_content(base_url + "auctionAction.html", data=payload)
-            
+                await self.bot.get_content(f"{base_url}auctionAction.html", data=payload)
                 results.append(f"{base_url}auction.html?id={auction_id}, type: {item}, price: {price}")
-            
-                await asyncio.sleep(randint(2, 7))  # <--- σωστό async sleep
-        
+
+                await asyncio.sleep(randint(2, 4))  # Delay για να μην spamάρουμε
+
             if results:
                 await ctx.send(f"**{nick}**\n" + "\n".join(results))
-    
+
+            page += 1  # Περνάμε στην επόμενη σελίδα
+
         if not utils.should_break(ctx):
             await ctx.send(f"**{nick}** Done bidding all auctions.")
 
