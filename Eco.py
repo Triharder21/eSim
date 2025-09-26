@@ -6,6 +6,30 @@ from datetime import datetime, time, timedelta
 from random import choice, randint, uniform
 from typing import Optional
 
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from random import choice, uniform, randint
+from asyncio import sleep
+import os, json, requests
+
+import os
+import json
+import asyncio
+from random import randint, uniform, choice
+from discord.ext.commands import command
+
+from utils import should_break
+import os
+import json
+import asyncio
+from random import choice, uniform, randint
+from time import sleep
+from lxml import html
+from discord.ext import commands
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+
+
 from discord import Embed
 from discord.ext.commands import Cog, Context, command
 from pytz import timezone
@@ -45,7 +69,7 @@ class Eco(Cog):
             await ctx.send(f"**{nick}** <{url}>")
 
     @command()
-    async def bid(self, ctx: Context, auction: Id, price: float, delay: Optional[bool] = False, *, nick: IsMyNick):
+    async def bid(self, ctx, auction: Id, price: float, delay: Optional[bool] = False, *, nick: IsMyNick):
         """Bidding an auction few seconds before its end"""
         base_url = f"https://{ctx.channel.name}.e-sim.org/"
 
@@ -117,29 +141,45 @@ class Eco(Cog):
                            f"You can edit it any time, or invoke the command again with all prices.\n"
                            f'You can now use `.bid_all_auctions {nick}`')
 
+
     @command()
-    async def bid_all_auctions(self, ctx: Context, *, nick: IsMyNick):
+    async def bid_all_auctions(self, ctx, *, nick: IsMyNick):
         """Bidding on all auctions.
         Type `.help set_auctions_prices` to see how to set the prices.
         You can set up friends that you won't overbid. See `.help friend`"""
+    
         server = ctx.channel.name
         base_url = f"https://{server}.e-sim.org/"
         file_name = f"auctions_prices_{server}.json"
+    
         if file_name not in os.listdir():
             return await ctx.invoke(self.bot.get_command("set_auctions_prices"), nick=nick)
-        else:
-            with open(file_name, "r", encoding="utf-8") as file:
-                prices = json.load(file)
+    
+        with open(file_name, "r", encoding="utf-8") as file:
+            prices = json.load(file)
+    
         await ctx.send(f"**{nick}** Ok. You can cancel with `.cancel bid_all_auctions {nick}`")
-
-        page = 1
+    
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            "Accept": "text/html,application/xhtml+xml,application/xml",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Referer": base_url,
+            "Connection": "keep-alive",
+        }
+    
         while not utils.should_break(ctx):
-            tree = await self.bot.get_content(f"{base_url}auctions.html?page={page}", return_tree=True)
+            # Παίρνουμε τη σελίδα auctions χωρίς pagination
+            tree = await self.bot.get_content(f"{base_url}auctions.html", return_tree=True)
+        
             buttons = tree.xpath("//*[@class='auctionButtons']/button[last()]")
             items = tree.xpath("//*[@class='auctionItem']//img[last()]//@src")
             current_prices = tree.xpath("//*[@class='auctionBidder']//b/text()")
-            if not buttons:  # last page
+        
+            if not buttons:
+                await ctx.send(f"**{nick}** Δεν υπάρχουν auctions.")
                 break
+        
             results = []
             for item, price, button in zip(items, current_prices, buttons):
                 item = item.split("/")[-1].split(".png")[0].replace("-", "_").replace("bandage_", "bandage")
@@ -147,26 +187,33 @@ class Eco(Cog):
                     item = item.split("_")[0]
                 elif item.count("_") == 2:  # eq_reshuffle_big.png
                     item = item.split("_")[1].split("-")[0]
+            
                 auction_id = button.attrib['data-id']
                 min_bid = button.attrib['data-minimal-outbid']
                 buyer = button.attrib['data-top-bidder'].lower()
-
+            
                 price = str(prices.get(item, "0")) or "0"
                 price = choice(price.split(","))
                 if "-" in price:
                     min_price, max_price = price.split("-")
                     price = round(uniform(float(min_price), float(max_price)), 2)
+            
                 if float(min_bid) > float(price) or buyer in ([nick.lower()] + self.bot.friends.get(server, [])):
                     continue
+            
                 if utils.should_break(ctx):
                     break
+            
                 payload = {'action': "BID", 'id': auction_id, 'price': price}
                 await self.bot.get_content(base_url + "auctionAction.html", data=payload)
+            
                 results.append(f"{base_url}auction.html?id={auction_id}, type: {item}, price: {price}")
-                await sleep(randint(2, 7))
+            
+                await asyncio.sleep(randint(2, 7))  # <--- σωστό async sleep
+        
             if results:
                 await ctx.send(f"**{nick}**\n" + "\n".join(results))
-            page += 1
+    
         if not utils.should_break(ctx):
             await ctx.send(f"**{nick}** Done bidding all auctions.")
 
