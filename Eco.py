@@ -146,13 +146,12 @@ class Eco(Cog):
                            f"You can edit it any time, or invoke the command again with all prices.\n"
                            f'You can now use `.bid_all_auctions {nick}`')
 
-
     @command()
     async def bid_all_auctions(self, ctx, *, nick: IsMyNick):
         """Bidding on all auctions.
         Type `.help set_auctions_prices` to see how to set the prices.
-        You can set up friends that you won't overbid. See `.help friend`"""
-    
+        You can set up friends that you won't overbid. See `.help friend` and `.set_custom_friends`"""
+
         server = ctx.channel.name
         base_url = f"https://{server}.e-sim.org/"
         file_name = f"auctions_prices_{server}.json"
@@ -163,6 +162,16 @@ class Eco(Cog):
         else:
             with open(file_name, "r", encoding="utf-8") as file:
                 prices = json.load(file)
+
+        # Φορτώνουμε custom friends
+        custom_friends_file = f"custom_friends_{server}.json"
+        custom_friends = []
+        if custom_friends_file in os.listdir():
+            with open(custom_friends_file, "r", encoding="utf-8") as f:
+                custom_friends = json.load(f)
+
+        # lowercase για σύγκριση
+        custom_friends = [f.lower() for f in custom_friends]
 
         await ctx.send(f"**{nick}** Ok. You can cancel with `.cancel bid_all_auctions {nick}`")
 
@@ -207,7 +216,10 @@ class Eco(Cog):
                     min_price, max_price = price.split("-")
                     price = round(uniform(float(min_price), float(max_price)), 2)
 
-                if float(min_bid) > float(price) or buyer in ([nick.lower()] + self.bot.friends.get(server, [])):
+                # Ενοποιούμε τους φίλους (in-game + custom + το ίδιο το nick)
+                all_friends = set([nick.lower()] + self.bot.friends.get(server, []) + custom_friends)
+
+                if float(min_bid) > float(price) or buyer in all_friends:
                     continue
                 if utils.should_break(ctx):
                     break
@@ -216,7 +228,7 @@ class Eco(Cog):
                 await self.bot.get_content(f"{base_url}auctionAction.html", data=payload)
                 results.append(f"{base_url}auction.html?id={auction_id}, type: {item}, price: {price}")
 
-                await asyncio.sleep(randint(2, 4))  # Delay για να μην spamάρουμε
+                await asyncio.sleep(randint(2, 7))  # Delay για να μην spamάρουμε
 
             if results:
                 await ctx.send(f"**{nick}**\n" + "\n".join(results))
@@ -225,6 +237,43 @@ class Eco(Cog):
 
         if not utils.should_break(ctx):
             await ctx.send(f"**{nick}** Done bidding all auctions.")
+
+    @command(hidden=True)
+    async def set_custom_friends(self, ctx: Context, nick: IsMyNick = None, *, friends: str = "[]"):
+        """
+        - Write `.set_custom_friends <nick>` to see current custom friends (first use shows a draft)
+        - You MUST paste the entire list and just change the names you want
+        """
+        server = ctx.channel.name
+        file_name = f"custom_friends_{server}.json"
+
+        try:
+            friends_list = json.loads(friends.replace("'", '"'))
+        except json.JSONDecodeError:
+            friends_list = []
+
+        if not friends_list:
+            if file_name in os.listdir():
+                with open(file_name, "r", encoding="utf-8") as file:
+                    await ctx.send("Current custom friends:\n" + file.read())
+            else:
+                await ctx.send(
+                    "Here's a draft:\n"
+                    f'.set_custom_friends "{nick or "MyNick"}" ' +
+                    '```json\n["friend1", "friend2", "anotherFriend"]```'
+                )
+                await ctx.send_help("set_custom_friends")
+        else:
+            friends_list = [f.lower() for f in friends_list]
+            with open(file_name, "w", encoding="utf-8") as file:
+                json.dump(friends_list, file)
+            await ctx.send(
+                f"**{nick or 'DefaultNick'}** I have created a file named `{file_name}` containing those friends.\n"
+                f"You can edit it any time, or invoke the command again with the full list.\n"
+                f'You can now use `.bid_all_auctions {nick or "MyNick"}` and it will avoid outbidding them.'
+            )
+        
+
 
     # @command()
     async def cc(self, ctx: Context, countries, max_price: float, amount: float, *, nick: IsMyNick):
