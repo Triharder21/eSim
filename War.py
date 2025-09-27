@@ -390,48 +390,32 @@ class War(Cog):
 
         side_str = "Left" if side == "defender" else "Right"
 
-        fight_clicked = False
         attempts = 0
-
-        while not fight_clicked and attempts < 5:
+        while attempts < 5:
             attempts += 1
 
-        # 1. Κλείσιμο popup αν υπάρχει
-            try:
-                popups = driver.find_elements(By.CLASS_NAME, "rewardModalContainer")
-                for popup in popups:
-                    if popup.is_displayed():
-                        try:
-                            close_btn = popup.find_element(By.CLASS_NAME, "modal-close")
-                            driver.execute_script("arguments[0].click();", close_btn)
-                            print("[DEBUG] Popup closed")
-                            time.sleep(random.uniform(0.3, 0.7))
-                        except Exception:
-                            # fallback click σε οποιοδήποτε σημείο της σελίδας
-                            driver.execute_script("arguments[0].click();", driver.find_element(By.TAG_NAME, "body"))
-                            print("[DEBUG] Popup detected, fallback click on body")
-                            time.sleep(random.uniform(0.3, 0.7))
-            except Exception:
-                pass  # αν δεν υπάρχει popup, προχωράμε κανονικά
-
-        # 2. Βρες fight button
+        # 1. Βρες fight button
             try:
                 fight_button = driver.find_element(By.ID, f"fightButton{side_str}Side")
             except NoSuchElementException:
-                fight_button = driver.find_element(By.ID, "fightButtonLeftSide")    
+                fight_button = driver.find_element(By.ID, "fightButtonLeftSide")
 
-        # 3. Αν είναι ορατό, κάνε click
+        # 2. Αν είναι ορατό, κάνε click
             if fight_button.is_displayed():
-                print(f"[DEBUG] Clicking fight button ({side}) attempt {attempts}")
-                actions = ActionChains(driver)
-                actions.move_to_element(fight_button).pause(random.uniform(0.1, 0.3)).click().perform()
-                fight_clicked = True
-                delay = random.uniform(0.5, 1)
-                print(f"[DEBUG] Waiting {delay:.2f}s after fight click")
+                try:
+                    actions = ActionChains(driver)
+                    actions.move_to_element(fight_button).pause(random.uniform(0.1, 0.3)).click().perform()
+                    print(f"[DEBUG] Clicking fight button ({side}) attempt {attempts}")
+                except Exception as e:
+                    print(f"[DEBUG] Click failed: {e}")
+
+            # συνέχισε αδιάφορα, ακόμα κι αν popup εμφανιστεί
+                delay = random.uniform(0.2, 0.7)
                 time.sleep(delay)
             else:
                 print(f"[DEBUG] Fight button not displayed, attempt {attempts}")
                 time.sleep(random.uniform(0.5, 1))
+
 
     @command(aliases=["fight_fast"])
     async def fight(self, ctx: Context, nick: IsMyNick, battle: Id, side: Side, weapon_quality: Quality = 5,
