@@ -14,12 +14,19 @@ from pytz import timezone
 from selenium.common.exceptions import NoSuchElementException
 from selenium.webdriver.common.by import By
 
+import asyncio
 import time
 import random
 from selenium.common.exceptions import NoSuchElementException
 from selenium.webdriver.common.by import By
 
 from selenium.common.exceptions import NoSuchElementException
+
+
+from random import choice, uniform
+from asyncio import sleep
+from typing import Optional
+from discord.ext import commands
 
 import utils
 from Converters import Country, Dmg, Id, IsMyNick, Product, Quality, Side
@@ -243,43 +250,143 @@ class War(Cog):
             await utils.update_info(server, nick, {"limits": f"{food_limit}/{gift_limit}"})
 
     @command(aliases=["travel"])
-    async def fly(self, ctx: Context, region_id: Id, ticket_quality: Optional[int] = 5, *, nick: IsMyNick) -> bool:
-        """traveling to a region.
-        If you do not have tickets of that quality, the bot will use lower quality"""
-        if 1 <= ticket_quality <= 5:
-            base_url = f"https://{ctx.channel.name}.e-sim.org/"
+    async def fly(self, ctx, region_id: int, ticket_quality: Optional[int] = 5, *, nick: IsMyNick) -> bool:
+        """
+        Traveling to a region (new interface).
+        Δίνεις region_id (συνήθως από battle page).
+        Αν δεν έχεις tickets του συγκεκριμένου Q, θα χρησιμοποιήσει χαμηλότερης ποιότητας.
+        """
+        if not (1 <= ticket_quality <= 5):
+            return ticket_quality == 0  # 0 σημαίνει "δεν χρειάζεται να πετάξω"
+
+        base_url = f"https://{ctx.channel.name}.e-sim.org/"
+
+        # 1. Region page
+        tree = await self.bot.get_content(f"{base_url}region.html?id={region_id}", return_tree=True)
+
+        # Hidden inputs για travel
+        country_id = tree.xpath('//form[contains(@action,"travel.html")]//input[@name="countryId"]/@value')
+        region_id_hidden = tree.xpath('//form[contains(@action,"travel.html")]//input[@name="regionId"]/@value')
+        redirect_url = tree.xpath('//form[contains(@action,"travel.html")]//input[@name="redirectUrl"]/@value')
+
+        # Αν δεν υπάρχουν → σημαίνει ότι είμαστε ήδη στην περιοχή
+        if not (country_id and region_id_hidden and redirect_url):
+            return True
+
+        # 2. Διαθέσιμα tickets
+        tickets_qualities = [int(x) for x in tree.xpath('//select[@id="ticketQuality"]/option/@value')] or [6]
+        if ticket_quality not in tickets_qualities:
+            if min(tickets_qualities) < ticket_quality:
+                ticket_quality = min(tickets_qualities)
+            else:
+                await ctx.reply(f"**{nick}** ERROR: there are 0 Q{ticket_quality} tickets in storage.")
+                return False
+
+        # 3. Health check
+        health_text = tree.xpath('//span[@id="actualHealth"]/text()')
+        health = float(health_text[0]) if health_text else 100.0
+        required_hp = 50 - ticket_quality * 10
+        if health < required_hp:
+            food_storage, gift_storage = utils.get_storage(tree)
+            food_limit, gift_limit = utils.get_limits(tree)
+            if food_limit and food_storage:
+                await self.bot.get_content(f"{base_url}Eat.html", data={'quality': 5})
+            elif gift_limit and gift_storage:
+                await self.bot.get_content(f"{base_url}gift.html", data={'quality': 5})
+            else:
+                await ctx.reply(f"**{nick}** ERROR: no health / limits.")
+                return False
+
+        # 4. Travel payload
+        payload = {
+            'countryId': country_id[0],
+            'regionId': region_id_hidden[0],
+            'ticketQuality': ticket_quality,
+            'redirectUrl': redirect_url[0],
+        }
+
+        # 5. POST στο travel.html
+        await self.bot.get_content(f"{base_url}region.html?id={region_id}")
+        url = await self.bot.get_content(f"{base_url}travel.html", data=payload)
+
+        await sleep(uniform(0, 1))
+        await ctx.send(f"**{nick}** <{url}>")
+        return True
+
+    @commands.command(aliases=["ttravel"])
+    async def tfarm(self, ctx, num_travels: int, ticket_quality: Optional[int] = 5, *, nick: str):
+        """
+        Τυχαίες μεταφορές σε διαφορετικά regions (χωρίς διπλές).
+        Χρήση: .tfarm <num_travels> <ticket_quality> <nick>
+        Παράδειγμα: .tfarm 10 5 Kostas
+        """
+        if not (1 <= ticket_quality <= 5):
+            await ctx.reply(f"**{nick}** ERROR: ticket_quality must be between 1-5.")
+            return
+
+        all_regions = list(range(1, 301))
+        visited = set()
+        base_url = f"https://{ctx.channel.name}.e-sim.org/"
+        travels_done = 0
+
+        while travels_done < num_travels:
+            available = [r for r in all_regions if r not in visited]
+            if not available:
+                await ctx.send(f"**{nick}** No more unique regions left to travel.")
+                break
+
+            region_id = random.choice(available)
             tree = await self.bot.get_content(f"{base_url}region.html?id={region_id}", return_tree=True)
-            country_id = tree.xpath('//*[@id="countryId"]/@value')
-            tickets_qualities = [int(x) for x in tree.xpath('//*[@id="ticketQuality"]//@value')] or [6]
-            if not country_id:  # already in the location
-                return True
-            if ticket_quality not in tickets_qualities:
-                if min(tickets_qualities) < ticket_quality:
-                    ticket_quality = min(tickets_qualities)
-                else:
-                    await ctx.reply(f"**{nick}** ERROR: there are 0 Q{ticket_quality} tickets in storage.")
-                    return False
-            health = utils.get_health(tree)
-            required_hp = 50 - ticket_quality * 10
-            if 0 and health < required_hp:  # TODO: fix this
+            country_id = tree.xpath('//form[contains(@action,"travel.html")]//input[@name="countryId"]/@value')
+            region_id_hidden = tree.xpath('//form[contains(@action,"travel.html")]//input[@name="regionId"]/@value')
+            redirect_url = tree.xpath('//form[contains(@action,"travel.html")]//input[@name="redirectUrl"]/@value')
+
+            if not (country_id and region_id_hidden and redirect_url):
+                await ctx.send(f"**{nick}** Already in region {region_id}, trying another...")
+                await asyncio.sleep(0.1)
+                continue
+
+            tickets_qualities = [int(x) for x in tree.xpath('//select[@id="ticketQuality"]/option/@value')] or [6]
+            ticket_use = ticket_quality if ticket_quality in tickets_qualities else min(tickets_qualities)
+
+            health_text = tree.xpath('//span[@id="actualHealth"]/text()')
+            health = float(health_text[0]) if health_text else 100.0
+            required_hp = 50 - ticket_use * 10
+
+            if health < required_hp:
                 food_storage, gift_storage = utils.get_storage(tree)
                 food_limit, gift_limit = utils.get_limits(tree)
                 if food_limit and food_storage:
-                    await self.bot.get_content(f"{base_url}eat.html", data={'quality': 5})
+                    await self.bot.get_content(f"{base_url}Eat.html", data={'quality': 5})
                 elif gift_limit and gift_storage:
                     await self.bot.get_content(f"{base_url}gift.html", data={'quality': 5})
                 else:
-                    await ctx.reply(f"**{nick}** ERROR: no health / limits.")
-                    return False
+                    await ctx.send(f"**{nick}** ERROR: no health / limits. Stopping tfarm.")
+                    break  # Τερματισμός
 
-            payload = {'ticketQuality': ticket_quality}
-            payload = {"payload": payload, "find_by": "css", "element": 'form[method="post"][action="travel.html"]'}
-            url = await self.bot.get_content(f"{base_url}region.html?id={region_id}", data=payload)
-            await sleep(uniform(0, 1))
-            await ctx.send(f"**{nick}** <{url}>")
-            return True
-        else:
-            return ticket_quality == 0  # ticket_quality=0 indicates that there's no need to fly.
+            payload = {
+                'countryId': country_id[0],
+                'regionId': region_id_hidden[0],
+                'ticketQuality': ticket_use,
+                'redirectUrl': redirect_url[0],
+            }
+
+            await self.bot.get_content(f"{base_url}region.html?id={region_id}")
+            url = await self.bot.get_content(f"{base_url}travel.html", data=payload)
+
+            visited.add(region_id)
+            travels_done += 1
+
+            await asyncio.sleep(random.uniform(0.5, 1.5))
+            await ctx.send(f"**{nick}** Travel {travels_done}/{num_travels} -> <{url}>")
+
+
+
+    @classmethod
+    def convert_to_dict(cls, s):
+        """convert to dict"""
+        return dict([a.split("=") for a in s.split("&")])
+
 
     @classmethod
     def convert_to_dict(cls, s):
@@ -410,7 +517,7 @@ class War(Cog):
                     print(f"[DEBUG] Click failed: {e}")
 
             # συνέχισε αδιάφορα, ακόμα κι αν popup εμφανιστεί
-                delay = random.uniform(0.2, 0.7)
+                delay = random.uniform(0.2, 0.5)
                 time.sleep(delay)
             else:
                 print(f"[DEBUG] Fight button not displayed, attempt {attempts}")
