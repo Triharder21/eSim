@@ -312,7 +312,7 @@ class War(Cog):
         await sleep(uniform(0, 1))
         await ctx.send(f"**{nick}** <{url}>")
         return True
-
+        
     @commands.command(aliases=["ttravel"])
     async def tfarm(self, ctx, num_travels: int, ticket_quality: Optional[int] = 5, *, nick: str):
         """
@@ -379,7 +379,6 @@ class War(Cog):
 
             await asyncio.sleep(random.uniform(0.5, 1.5))
             await ctx.send(f"**{nick}** Travel {travels_done}/{num_travels} -> <{url}>")
-
 
 
     @classmethod
