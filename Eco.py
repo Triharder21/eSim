@@ -228,7 +228,7 @@ class Eco(Cog):
                 await self.bot.get_content(f"{base_url}auctionAction.html", data=payload)
                 results.append(f"{base_url}auction.html?id={auction_id}, type: {item}, price: {price}")
 
-                await asyncio.sleep(randint(2, 7))  # Delay για να μην spamάρουμε
+                await asyncio.sleep(randint(1, 3))  # Delay για να μην spamάρουμε
 
             if results:
                 await ctx.send(f"**{nick}**\n" + "\n".join(results))
