@@ -1019,7 +1019,7 @@ class War(Cog):
                     damage_done += 5
                 else:
                     damage_done += int(str(tree.xpath('//*[@id="DamageDone"]')[0].text).replace(",", ""))
-                await sleep(uniform(0, 2))
+                await sleep(uniform(0, 1))
 
             await ctx.send(f"**{nick}** done {damage_done:,} {hits_or_dmg} at <{link}>")
             if not utils.should_break(ctx):
