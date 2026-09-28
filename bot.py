@@ -112,12 +112,16 @@ async def start() -> None:
 
 def login(server: str) -> None:
     driver = bot.browser_window
-    try:  # στην αρχική σελίδα η φόρμα εμφανίζεται μετά το κουμπί Login
-        login_button = driver.find_element(By.ID, 'navigateToLogin')
-        if login_button.is_displayed():
-            login_button.click()
-    except Exception:
-        pass
+    # στην αρχική σελίδα η φόρμα login είναι κρυφή μέχρι να πατηθεί το κουμπί "Login"
+    # (νέο: <button onclick="showRegisterLogin(false);">, παλιό: #navigateToLogin, tab: #login_section_btn)
+    for selector in ("button[onclick*='showRegisterLogin(false)']", "#navigateToLogin", "#login_section_btn"):
+        buttons = [b for b in driver.find_elements(By.CSS_SELECTOR, selector) if b.is_displayed()]
+        if buttons:
+            try:
+                buttons[0].click()
+            except Exception:
+                driver.execute_script("arguments[0].click();", buttons[0])
+            break
 
     def visible_login_input(d):
         # μπορεί να υπάρχουν πολλές φόρμες login (κάποιες κρυφές): πάρε αυτή που φαίνεται
@@ -198,10 +202,14 @@ async def get_content(link: str = None, data: dict = None, return_tree: bool = F
     tree = fromstring(driver.page_source)
 
     logged = tree.xpath('//*[@id="command"]')
-    if not incognito and (any("Iogin.html" in x.action for x in logged) or tree.xpath('//*[@id="navigateToLogin"]')):
+    # αποσυνδεδεμένοι: φόρμα login (Iogin.html) χωρίς κουμπί Logout (+ τα παλιά σημάδια)
+    logged_out = (any("Iogin.html" in x.action for x in logged) or tree.xpath('//*[@id="navigateToLogin"]')
+                  or (tree.xpath('//form[contains(@action, "Iogin.html")]') and not tree.xpath('//*[@id="logoutForm"]')))
+    if not incognito and logged_out:
         if not logged_in:
             server = link.split("https://", 1)[1].split(".e-sim.org", 1)[0]
-            login(server)
+            bot.logged_in_servers.discard(server)
+            await login_from_homepage(server)  # login από την αρχική σελίδα
             return await get_content(link, data, return_tree, incognito, True)  # call the function again
         else:
             raise ConnectionError("notLoggedIn")
