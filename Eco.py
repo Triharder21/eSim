@@ -10,7 +10,7 @@ from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from random import choice, uniform, randint
 from asyncio import sleep
-import os, json, requests
+import os, json
 
 from random import choice, uniform, randint
 from asyncio import sleep
