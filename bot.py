@@ -118,8 +118,17 @@ def login(server: str) -> None:
             login_button.click()
     except Exception:
         pass
-    login_form = driver.find_element(By.CSS_SELECTOR, "form[action='Iogin.html']")
-    username_input = login_form.find_element(By.NAME, "login")
+
+    def visible_login_input(d):
+        # μπορεί να υπάρχουν πολλές φόρμες login (κάποιες κρυφές): πάρε αυτή που φαίνεται
+        for field in d.find_elements(By.CSS_SELECTOR, "form[action='Iogin.html'] input[name='login']"):
+            if field.is_displayed():
+                return field
+        return False
+
+    # περίμενε να εμφανιστεί η φόρμα (animation μετά το click)
+    username_input = WebDriverWait(driver, 10).until(visible_login_input)
+    login_form = username_input.find_element(By.XPATH, "./ancestor::form")
     password_input = login_form.find_element(By.NAME, "password")
     nick = utils.my_nick(server)
     username_input.send_keys(nick)
@@ -146,8 +155,9 @@ async def login_from_homepage(server: str) -> None:
     driver.get(f"https://{server}.e-sim.org/")
     WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
     await asyncio.sleep(uniform(1, 2.5))
-    # login form ή κουμπί login -> δεν είμαστε συνδεδεμένοι
-    if driver.find_elements(By.CSS_SELECTOR, "form[action='Iogin.html']") or driver.find_elements(By.ID, "navigateToLogin"):
+    # συνδεδεμένοι = υπάρχει το Logout / η μπάρα energy. Αλλιώς login.
+    logged_in = driver.find_elements(By.ID, "logoutForm") or driver.find_elements(By.ID, "actualHealth")
+    if not logged_in:
         login(server)
         WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
         await asyncio.sleep(uniform(1.5, 3))
