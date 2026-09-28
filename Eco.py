@@ -28,7 +28,8 @@ import os
 import json
 import asyncio
 from random import choice, uniform, randint
-from time import sleep
+import time as time_module  # το `time` από κάτω είναι το datetime.time
+from asyncio import sleep  # async sleep (όλα τα "await sleep(...)" του αρχείου)
 from lxml import html
 from discord.ext import commands
 from selenium import webdriver
@@ -41,6 +42,10 @@ from pytz import timezone
 
 import utils
 from Converters import Country, Id, IsMyNick, Product, Quality
+from selenium.webdriver.common.action_chains import ActionChains
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import Select
+from random import shuffle
 
 
 class Eco(Cog):
@@ -150,33 +155,41 @@ class Eco(Cog):
     async def bid_all_auctions(self, ctx, *, nick: IsMyNick):
         """Bidding on all auctions.
         Type `.help set_auctions_prices` to see how to set the prices.
-        You can set up friends that you won't overbid. See `.help friend` and `.set_custom_friends`"""
+        You can set up friends that you won't overbid. See `.help friend`
+        """
 
         server = ctx.channel.name
         base_url = f"https://{server}.e-sim.org/"
         file_name = f"auctions_prices_{server}.json"
+        friends_file = f"custom_friends_{server}.json"
 
-        # Αν δεν υπάρχει αρχείο τιμών, τρέχουμε τη διαδικασία δημιουργίας
+        # Load auction prices
         if file_name not in os.listdir():
-            return await ctx.invoke(self.bot.get_command("set_auctions_prices"), nick=nick)
-        else:
-            with open(file_name, "r", encoding="utf-8") as file:
-                prices = json.load(file)
+            return await ctx.invoke(
+                self.bot.get_command("set_auctions_prices"),
+                nick=nick
+            )
 
-        # Φορτώνουμε custom friends
-        custom_friends_file = f"custom_friends_{server}.json"
+        with open(file_name, "r", encoding="utf-8") as file:
+            prices = json.load(file)
+
+        # Load custom friends
         custom_friends = []
-        if custom_friends_file in os.listdir():
-            with open(custom_friends_file, "r", encoding="utf-8") as f:
-                custom_friends = json.load(f)
+        if friends_file in os.listdir():
+            with open(friends_file, "r", encoding="utf-8") as file:
+                custom_friends = json.load(file)
 
-        # lowercase για σύγκριση
-        custom_friends = [f.lower() for f in custom_friends]
+        custom_friends = [friend.lower() for friend in custom_friends]
 
-        await ctx.send(f"**{nick}** Ok. You can cancel with `.cancel bid_all_auctions {nick}`")
+        await ctx.send(
+            f"**{nick}** Ok. You can cancel with "
+            f"`.cancel bid_all_auctions {nick}`"
+        )
 
         page = 1
+
         while not utils.should_break(ctx):
+
             url = (
                 f"{base_url}auctionsOffers?"
                 f"status=IN_PROGRESS&"
@@ -188,55 +201,124 @@ class Eco(Cog):
                 f"selectedAuctionEquipmentSorting_TIME=true"
             )
 
-            tree = await self.bot.get_content(url, return_tree=True)
+            tree = await self.bot.get_content(
+                url,
+                return_tree=True
+            )
 
-            # Επιλογή κουμπιών και στοιχείων
-            buttons = tree.xpath("//*[@class='auctionButtons']/button[last()]")
-            items = tree.xpath("//*[@class='auctionItem']//img[last()]//@src")
-            current_prices = tree.xpath("//*[@class='auctionBidder']//b/text()")
+            # Παίρνουμε ΜΟΝΟ τα πλήρη BID buttons.
+            # Όλα τα στοιχεία του auction βρίσκονται πλέον
+            # στα data-* attributes του ίδιου button.
+            buttons = tree.xpath(
+                "//button[@data-action='BID' "
+                "and @data-id "
+                "and @data-minimal-outbid]"
+            )
 
-            if not buttons:  # Δεν υπάρχουν άλλα auctions
+            if not buttons:
                 break
 
             results = []
-            for item, price, button in zip(items, current_prices, buttons):
-                item = item.split("/")[-1].split(".png")[0].replace("-", "_").replace("bandage_", "bandage")
-                if item.count("_") == 1:
-                    item = item.split("_")[0]
-                elif item.count("_") == 2:
-                    item = item.split("_")[1].split("-")[0]
 
-                auction_id = button.attrib['data-id']
-                min_bid = button.attrib['data-minimal-outbid']
-                buyer = button.attrib['data-top-bidder'].lower()
+            for button in buttons:
 
-                price = str(prices.get(item, "0")) or "0"
-                price = choice(price.split(","))
-                if "-" in price:
-                    min_price, max_price = price.split("-")
-                    price = round(uniform(float(min_price), float(max_price)), 2)
-
-                # Ενοποιούμε τους φίλους (in-game + custom + το ίδιο το nick)
-                all_friends = set([nick.lower()] + self.bot.friends.get(server, []) + custom_friends)
-
-                if float(min_bid) > float(price) or buyer in all_friends:
-                    continue
                 if utils.should_break(ctx):
                     break
 
-                payload = {'action': "BID", 'id': auction_id, 'price': price}
-                await self.bot.get_content(f"{base_url}auctionAction.html", data=payload)
-                results.append(f"{base_url}auction.html?id={auction_id}, type: {item}, price: {price}")
+                auction_id = button.attrib["data-id"]
+                min_bid = button.attrib["data-minimal-outbid"]
+                buyer = button.attrib.get(
+                    "data-top-bidder", ""
+                ).strip().lower()
 
-                await asyncio.sleep(randint(1, 3))  # Delay για να μην spamάρουμε
+                auction_item = button.attrib.get(
+                    "data-auction-item", ""
+                )
+
+                # Example:
+                # "Q1 VISION null ..."
+                item_parts = auction_item.split()
+
+                if len(item_parts) < 2:
+                    continue
+
+                quality = item_parts[0].lower()
+                item_type = item_parts[1].lower()
+
+                # Q1 -> 1, Q2 -> 2, etc.
+                if not quality.startswith("q"):
+                    continue
+
+                q = quality[1:]
+
+                # Convert auction item name to the same names
+                # used in auctions_prices_<server>.json
+                item = f"{item_type}{q}"
+
+                # Friends: in-game friends + custom friends + own nick
+                all_friends = set(
+                    [nick.lower()]
+                    + [
+                        friend.lower()
+                        for friend in self.bot.friends.get(server, [])
+                    ]
+                    + custom_friends
+                )
+
+                # Price configured for this item
+                price = str(prices.get(item, "0")) or "0"
+                price = choice(price.split(","))
+
+                if "-" in price:
+                    min_price, max_price = price.split("-")
+                    price = round(
+                        uniform(
+                            float(min_price),
+                            float(max_price)
+                        ),
+                        2
+                    )
+
+                # Don't bid if:
+                # - minimum outbid is higher than our configured price
+                # - current bidder is a friend
+                # - current bidder is ourselves
+                if (
+                    float(min_bid) > float(price)
+                    or buyer in all_friends
+                ):
+                    continue
+
+                payload = {
+                    "action": "BID",
+                    "id": auction_id,
+                    "price": price
+                }
+
+                await self.bot.get_content(
+                    f"{base_url}auctionAction.html",
+                    data=payload
+                )
+
+                results.append(
+                    f"{base_url}auction.html?id={auction_id}, "
+                    f"type: {item}, price: {price}"
+                )
+
+                # blocking sleep εδώ (σκόπιμα)
+                time_module.sleep(randint(2, 7))
 
             if results:
-                await ctx.send(f"**{nick}**\n" + "\n".join(results))
+                await ctx.send(
+                    f"**{nick}**\n" + "\n".join(results)
+                )
 
-            page += 1  # Περνάμε στην επόμενη σελίδα
+            page += 1
 
         if not utils.should_break(ctx):
-            await ctx.send(f"**{nick}** Done bidding all auctions.")
+            await ctx.send(
+                f"**{nick}** Done bidding all auctions."
+            )
 
     @command(hidden=True)
     async def set_custom_friends(self, ctx: Context, nick: IsMyNick = None, *, friends: str = "[]"):
@@ -679,9 +761,77 @@ class Eco(Cog):
             results.append(f"ID {eq_id} - <{url}>")
         await ctx.send(f"**{nick}**\n" + "\n".join(results))
 
+    def page_error(self) -> str:
+        """Το κόκκινο μήνυμα λάθους του game (π.χ. "There is no money in the company..."), αν υπάρχει."""
+        errors = [e for e in self.bot.browser_window.find_elements(By.CSS_SELECTOR, "#newError, .newError")
+                  if e.get_attribute("textContent").strip()]
+        return " ".join(errors[0].get_attribute("textContent").split()) if errors else ""
+
+    def human_click(self, element):
+        ActionChains(self.bot.browser_window).move_to_element(element).pause(uniform(0.3, 0.8)).click().perform()
+
+    def done_notice(self) -> bool:
+        """Μετά από work/train το game δείχνει το .workNotify ("You will be able to work again in:" / "You can train again in:")."""
+        return any(e.is_displayed() for e in self.bot.browser_window.find_elements(By.CSS_SELECTOR, ".workNotify"))
+
+    async def wait_for_result(self) -> str:
+        """Περιμένει μέχρι 15 sec: "done" (.workNotify) ή το μήνυμα λάθους (.newError)."""
+        for _ in range(30):
+            await sleep(0.5)
+            if self.page_error():
+                return self.page_error()
+            if self.done_notice():
+                return "done"
+        return "no answer from the game"
+
+    async def _train(self, base_url: str) -> str:
+        """train.html -> Train. Επιστρέφει το μήνυμα για το Discord."""
+        driver = self.bot.browser_window
+        await self.bot.get_content(base_url + "train.html")
+        await sleep(uniform(1.5, 3.5))
+        buttons = [b for b in driver.find_elements(By.ID, "trainButton") if b.is_displayed()]
+        if not buttons:
+            return "Already trained" if self.done_notice() else "ERROR: Couldn't find the Train button"
+        self.human_click(buttons[0])
+        result = await self.wait_for_result()
+        return "Trained successfully" if result == "done" else f"ERROR: Couldn't train: {result}"
+
+    async def _work(self, base_url: str, ticket_quality: int) -> str:
+        """work.html -> (Travel αν χρειάζεται) -> Work. Επιστρέφει το μήνυμα για το Discord."""
+        driver = self.bot.browser_window
+        await self.bot.get_content(base_url + "work.html")
+        await sleep(uniform(1.5, 3.5))
+
+        # "You cannot work from your current location" -> φόρμα travel.html με ticket
+        travel = [b for b in driver.find_elements(By.CSS_SELECTOR, "form[action='travel.html'] button.travel")
+                  if b.is_displayed()]
+        if travel:
+            select = Select(travel[0].find_element(By.XPATH, "./ancestor::form//select[@name='ticketQuality']"))
+            qualities = [int(o.get_attribute("value")) for o in select.options]
+            if ticket_quality not in qualities:
+                return f"ERROR: Couldn't travel to work: no Q{ticket_quality} tickets (you have Q{qualities})"
+            select.select_by_value(str(ticket_quality))
+            await sleep(uniform(0.8, 2))
+            self.human_click(travel[0])
+            await sleep(uniform(3, 5))
+            if self.page_error():
+                return f"ERROR: Couldn't travel to work: {self.page_error()}"
+
+        buttons = [b for b in driver.find_elements(By.ID, "workButton") if b.is_displayed()]
+        if not buttons:
+            return "Already worked" if self.done_notice() else "ERROR: Couldn't find the Work button"
+        await sleep(uniform(1, 2.5))
+        self.human_click(buttons[0])
+        # λάθος (π.χ. no money / no resources) -> σταματάει εδώ, χωρίς νέα προσπάθεια
+        result = await self.wait_for_result()
+        return "Worked successfully" if result == "done" else f"ERROR: Couldn't work: {result}"
+
     @command(aliases=["w", "work+"])
-    async def work(self, ctx: Context, *, nick: IsMyNick):
-        """`work+` -> for premium users (https://primera.e-sim.org/taskQueue.html)"""
+    async def work(self, ctx: Context, ticket_quality: Optional[int] = 5, *, nick: IsMyNick):
+        """Train + work (με τυχαία σειρά).
+        ticket_quality: με ποιο ticket θα πάει στο region της εταιρείας αν χρειάζεται (1-5, default 5).
+        Παράδειγμα: .work 1 Kostas
+        `work+` -> for premium users (https://primera.e-sim.org/taskQueue.html)"""
 
         server = ctx.channel.name
         base_url = f"https://{server}.e-sim.org/"
@@ -692,45 +842,29 @@ class Eco(Cog):
             await sleep(uniform(1, 2))
             await self.bot.get_content(base_url + "taskQueue.html", data=payload2)
 
-        tree = await self.bot.get_content(base_url, return_tree=True)
-
-        async def _train():
-            payload = {"find_by": "id", "element": "taskButtonTrain", "click": True}
-            await self.bot.get_content(data=payload)
-            payload = {"find_by": "id", "element": "trainButton", "click": True}
-            await self.bot.get_content(data=payload)
-
-        async def _work():
-            payload = {"find_by": "id", "element": "taskButtonWork", "click": True}
-            tree = await self.bot.get_content(data=payload, return_tree=True)
-            if tree.xpath('//*[@class="travel button foundation-style"]'):
-                payload = {"find_by": "class", "element": "travel"}
-                await self.bot.get_content(data=payload)
-            payload = {"find_by": "id", "element": "workButton", "click": True}
-            await self.bot.get_content(data=payload)
-
-        train_first = randint(1, 2) == 1
-        if train_first and tree.xpath('//*[@id="taskButtonTrain"]//@href'):
-            await _train()
-            await ctx.send(f"**{nick}** Trained successfully")
-            await sleep(uniform(3, 30))
-
-        if tree.xpath('//*[@id="taskButtonWork"]//@href'):
+        async def work_step():
             try:
-                await _work()
+                result = await self._work(base_url, ticket_quality)
+            except Exception as exc:
+                result = f"ERROR: Couldn't work. Error: {str(exc).strip().splitlines()[0]}"
+            if result == "Worked successfully":
                 data = await utils.find_one(server, "info", nick)
                 data["Worked at"] = datetime.now().astimezone(timezone('Europe/Berlin')).strftime("%d/%m  %H:%M")
                 await utils.replace_one(server, "info", nick, data)
-                await ctx.send(f"**{nick}** Worked successfully")
+            await ctx.send(f"**{nick}** {result}")
+
+        async def train_step():
+            try:
+                result = await self._train(base_url)
             except Exception as exc:
-                await ctx.send(f"**{nick}** ERROR: Couldn't work. Error: {exc}")
-        else:
-            await ctx.send(f"**{nick}** Already worked")
-        if not train_first and tree.xpath('//*[@id="taskButtonTrain"]//@href'):
-            await _train()
-            await ctx.send(f"**{nick}** Trained successfully")
-        await sleep(uniform(1, 3))
-        # await ctx.invoke(self.bot.get_command("read"), nick=nick)
+                result = f"ERROR: Couldn't train. Error: {str(exc).strip().splitlines()[0]}"
+            await ctx.send(f"**{nick}** {result}")
+
+        steps = [train_step, work_step]
+        shuffle(steps)
+        await steps[0]()
+        await sleep(uniform(3, 15))
+        await steps[1]()
 
     @command()
     async def auto_fly(self, ctx: Context, ticket_quality: int, country: Optional[Country] = 26,

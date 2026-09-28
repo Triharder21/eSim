@@ -1,9 +1,8 @@
-This is not owned by me, the original creator discontinued the project and allowed me to keep updating it for personal use. If any issue arises contact me and I'll take it down!
-
 # E-sim python library
 
 [![Flag Counter](https://s01.flagcounter.com/mini/5j6R/bg_FFFFFF/txt_000000/border_CCCCCC/flags_0/)](https://info.flagcounter.com/5j6R)
 
+If you appreciate my hard word, please consider [buying me a coffee](https://www.buymeacoffee.com/RipEsim). Thanks :)
 
 #### Table of Content:
 

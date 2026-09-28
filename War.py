@@ -15,6 +15,8 @@ from selenium.common.exceptions import NoSuchElementException
 from selenium.webdriver.common.by import By
 
 import asyncio
+import re
+from itertools import chain, islice
 import time
 import random
 from selenium.common.exceptions import NoSuchElementException
@@ -27,9 +29,14 @@ from random import choice, uniform
 from asyncio import sleep
 from typing import Optional
 from discord.ext import commands
+from selenium.common.exceptions import TimeoutException
+from selenium.webdriver.common.action_chains import ActionChains
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
+
 
 import utils
-from Converters import Country, Dmg, Id, IsMyNick, Product, Quality, Side
+from Converters import Country, Dmg, FoodOrGift, Id, IsMyNick, MotivateType, Product, Quality, Side
 
 
 # You may want to replace all `consume_first="gift"` to `consume_first="food"`
@@ -41,84 +48,105 @@ class War(Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    async def dump_health(self, server, battle_id, side, wep):
-        """Hit all limits with human-like delay"""
-        base_url = f"https://{server}.e-sim.org/"
-
-    # Περιμένουμε να πάρουμε σωστά fight_url και data
-        fight_url, data = None, None
-        for attempt in range(10):  # max 10 προσπάθειες
-            tree = await self.bot.get_content(f'{base_url}battle.html?id={battle_id}', return_tree=True)
-            fight_url, data = await self.get_fight_data(base_url, tree, wep, side)
-            if fight_url and data:
+    async def fight_restore(self, link: str, side: Optional[str], weapon_quality: int) -> (int, int, str, str, str):
+        """
+        Ένα restore: χτυπάει Berserk με το health που έχει (100HP από το restore) και μετά συνεχίζει
+        να πατάει Fight (το game τρώει μόνο του) μέχρι health = 0 και limits -1 food, -1 gift.
+        Π.χ. 100HP, 11/11 limits -> 0HP, 10/10 limits.
+        Τα free hits (avoid) δεν πειράζουν: μετράμε health και limits, όχι χτυπήματα.
+        side=None: όποια πλευρά δείχνει η σελίδα (random mode).
+        Επιστρέφει (πλευρά, berserks, damage, τι έφαγε, error ή "").
+        """
+        driver = self.bot.browser_window
+        tree = await self.bot.get_content(link, return_tree=True)
+        side = side or self.visible_fight_side()
+        if not side:
+            return "", 0, 0, "", "ERROR: can't fight in this battle from your current location"
+        error = self.setup_fight(weapon_quality, side, "none")
+        if error:
+            return side, 0, 0, "", error
+        start_food, start_gift = utils.get_limits(tree)
+        berserks = damage_done = no_answer = 0
+        while True:
+            health = utils.get_health(tree) or 0
+            if health < 50:
+                # το επόμενο Fight θα φάει: ξαναφόρτωσε για σωστά health / limits
+                tree = await self.bot.get_content(link, return_tree=True)
+                health = utils.get_health(tree) or 0
+                food_limit, gift_limit = utils.get_limits(tree)
+                food_used, gift_used = start_food - food_limit, start_gift - gift_limit
+                # τέλος restore: 0 health και έφαγε 1 food + 1 gift (ή δεν έχει άλλα limits)
+                if health < 50 and ((food_used >= 1 and gift_used >= 1) or food_limit + gift_limit == 0):
+                    if health != 0:
+                        error = f"WARNING: finished with {health} health instead of 0"
+                    break
+                error = self.setup_fight(weapon_quality, side, "none")
+                if error:
+                    break
+            if not self.click_fight(side):
+                no_answer += 1
+                if no_answer >= 3:
+                    error = "the fight button doesn't respond"
+                    break
+                continue
+            no_answer = 0
+            tree = fromstring(driver.page_source)
+            response = tree.xpath('//*[@id="fightResponse"]')
+            response_text = " ".join((response[0].text_content() if response else "").split())
+            damage = tree.xpath('//*[@id="fightResponse"]//*[@id="DamageDone"]')
+            if not damage:
+                if "Slow down" in response_text:
+                    continue  # δεν μετράει, ξαναδοκίμασε
+                if "Round is closed" in response_text:
+                    error = "round is over"
+                elif "No health left" not in response_text:
+                    error = response_text[:300]
                 break
-            await sleep(1)  # μικρό delay πριν retry
+            berserks += 1
+            damage_done += int(re.sub(r"\D", "", damage[0].text_content().split("+")[0]) or 0)
+            await sleep(uniform(0.5, 2))
 
-        if not fight_url or not data:
-            print(f"[WARNING] Could not get fight data for battle {battle_id}")
-            return
-
-    # Τώρα μπορούμε να βαράμε
-        for _ in range(1, 20):
-            try:
-                health = utils.get_health(tree)
-                if not health or health == 0:
-                    tree = await self.bot.get_content(f'{base_url}battle.html?id={battle_id}', return_tree=True)
-                    health = utils.get_health(tree)
-                    if not health or health == 0:
-                        break  # σταματάει αν όντως είσαι στο 0
-
-        # πάντα προσπαθεί να βαράει, popup ή όχι
-                data["value"] = "Berserk" if health >= 50 else ""
-                tree = await self.bot.get_content(fight_url, data=data, return_tree=True)
-                print("[DEBUG] Fight request sent")
-
-            except Exception as e:
-                print(f"[WARNING] Fight click failed, συνεχίζω... ({e})")
-        # δεν κάνει break, συνεχίζει κατευθείαν στο επόμενο loop
-
-            await sleep(uniform(1, 4))
+        tree = await self.bot.get_content(link, return_tree=True)
+        food_limit, gift_limit = utils.get_limits(tree)
+        ate = (f"{start_food - food_limit} food, {start_gift - gift_limit} gift, "
+               f"limits now {food_limit}/{gift_limit}, health {utils.get_health(tree)}")
+        return side, berserks, damage_done, ate, error
 
     @command()
     async def auto_fight(self, ctx: Context, nick: IsMyNick, battle_id: Id = 0, side: Side = "attacker",
-                         wep: Quality = 0,
-                         food: Quality = 5, gift: Quality = 0, ticket_quality: Quality = 5,
+                         wep: Quality = 5, ticket_quality: Quality = 5,
                          chance_to_skip_restore: int = 7, restores: int = 120):
-        """Dumping health at a random time every restore
+        """Κάθε restore (~10 λεπτά, σε τυχαία ώρα): Berserk με τα 100HP και μετά μέχρι να φάει 1 food + 1 gift.
         (everything inside [] is optional with default values)
-        `battle_id=0` means random battle.
+        `battle_id=0` means random battle and any side (το `side` αγνοείται, χτυπάει όποια πλευρά δείχνει η σελίδα).
 
         If `nick` contains more than 1 word - it must be within quotes.
         You can write multiple nicks: "nick 1, nick 2, ..."
 
-        Example: `.auto_fight "My Nick" 0 attacker 1 5 5 1 0 100`
-        [In this example: battle=0 (random), fight for the attacker side, wep quality=1, food and gift quality=5, ticket quality=1, no skip restores (0%), 120 restores (20 hours)]"""
+        Example: `.auto_fight "My Nick" 184816 attacker 5 5 0 100`
+        [battle 184816, attacker side, Q5 weapons, Q5 ticket, no skipped restores (0%), 100 restores]"""
 
-        data = {"restores": restores, "battle_id": battle_id, "side": side, "wep": wep, "food": food,
-                "gift": gift, "ticket_quality": ticket_quality, "chance_to_skip_restore": chance_to_skip_restore}
+        # Δεν αποθηκεύεται: αν κλείσει το script, σταματάει (δεν ξαναξεκινάει μόνο του).
+        utils.remove_finished_command(ctx)
         ctx.command = f"auto_fight-{ctx.message.id}"
-        await utils.save_command(ctx, "auto", "fight", data)
+        utils.add_command(ctx)  # για να δουλεύει το .cancel auto_fight-<id>
 
         server = ctx.channel.name
         base_url = f"https://{server}.e-sim.org/"
         specific_battle = (battle_id != 0)
+        await ctx.send(f"**{nick}** Starting auto_fight. If you want to stop it, type "
+                       f"`.cancel auto_fight-{ctx.message.id} {nick}`")
         while restores > 0 and not utils.should_break(ctx):
             restores -= 1
             if randint(0, 100) <= chance_to_skip_restore:
                 await sleep(600)
             if not battle_id:
                 battle_id = await utils.get_battle_id(self.bot, str(nick), server, battle_id)
-            await ctx.send(f'**{nick}** <{base_url}battle.html?id={battle_id}> side: {side}\n'
-                           f'If you want to stop it, type `.cancel auto_fight-{ctx.message.id} {nick}`')
             if not battle_id:
                 await ctx.send(
                     f"**{nick}** WARNING: I can't fight in any battle right now, but I will check again after the next restore")
                 await utils.random_sleep(restores)
                 continue
-            tree = await self.bot.get_content(base_url + "home.html", return_tree=True)
-            # Don't work as soon as you can (suspicious)
-            if tree.xpath('//*[@id="taskButtonWork"]//@href') and randint(1, 4) == 2:
-                await ctx.invoke(self.bot.get_command("work"), nick=nick)
             api_battles = await self.bot.get_content(f"{base_url}apiBattles.html?battleId={battle_id}")
             if 8 in (api_battles['attackerScore'], api_battles['defenderScore']):
                 if specific_battle:
@@ -126,38 +154,36 @@ class War(Cog):
                     break
                 await ctx.send(f"**{nick}** Searching for the next battle...")
                 battle_id = await utils.get_battle_id(self.bot, str(nick), server, battle_id)
+                if not battle_id:
+                    await utils.random_sleep(restores)
+                    continue
+                api_battles = await self.bot.get_content(f"{base_url}apiBattles.html?battleId={battle_id}")
             if specific_battle and 1 <= ticket_quality <= 5:
                 bonus_region = await utils.get_bonus_region(self.bot, base_url, side, api_battles)
                 if bonus_region:
                     if not await ctx.invoke(self.bot.get_command("fly"), bonus_region, ticket_quality, nick=nick):
-                        restores = 0
-            tree = await self.bot.get_content(f'{base_url}battle.html?id={battle_id}', return_tree=True)
-            fight_ability = tree.xpath("//*[@id='newFightView']//div[3]//div[3]//div//text()[1]")
-            driver = self.bot.browser_window
-            try:
-                berserk_checkbox = driver.find_element(By.ID, f"{side}BerserkCheckbox")  # attackerBerserkCheckbox / defenderBerserkCheckbox
-                driver.execute_script("arguments[0].click();", berserk_checkbox)
-                print(f"[DEBUG] Selected Berserk (x5) hit for side {side}")
-            except NoSuchElementException:
-                print("[DEBUG] Could not find Berserk (x5) checkbox, continuing with default hit")
-            if any("You can't fight in this battle from your current location." in s for s in fight_ability):
-                if specific_battle and 1 <= ticket_quality <= 5:
-                    bonus_region = await utils.get_bonus_region(self.bot, base_url, side, api_battles)
-                    if bonus_region:
-                        if not await ctx.invoke(self.bot.get_command("fly"), bonus_region, ticket_quality, nick=nick):
-                            break
-                await ctx.send(f"**{nick}** ERROR: You can't fight in this battle from your current location.")
-                break
-            await self.dump_health(server, battle_id, side, wep)
-            if food:
-                await self.bot.get_content(f"{base_url}eat.html", data={'quality': food})
-            if gift:
-                await self.bot.get_content(f"{base_url}gift.html", data={'quality': gift})
-            if food or gift:
-                await self.dump_health(server, battle_id, side, wep)
+                        break
+
+            link = f"{base_url}battle.html?id={battle_id}"
+            # random mode: όποια πλευρά δείχνει η σελίδα
+            side_used, berserks, damage, ate, error = await self.fight_restore(
+                link, side if specific_battle else None, wep)
+            if not specific_battle and not side_used and 1 <= ticket_quality <= 5:
+                # δεν μπορείς να χτυπήσεις από εδώ: πέτα στο bonus region μιας τυχαίας πλευράς και ξαναδοκίμασε
+                bonus_region = await utils.get_bonus_region(
+                    self.bot, base_url, choice(["attacker", "defender"]), api_battles)
+                if bonus_region and await ctx.invoke(self.bot.get_command("fly"), bonus_region, ticket_quality,
+                                                     nick=nick):
+                    side_used, berserks, damage, ate, error = await self.fight_restore(link, None, wep)
+            await ctx.send(f"**{nick}** <{link}> {side_used}: {berserks} berserks, {damage:,} dmg (ate {ate})."
+                           + (f"\n{error}" if error else "") + f" Restores left: {restores}")
+            if error.startswith("ERROR"):  # π.χ. λάθος τοποθεσία
+                if specific_battle:
+                    break
+                battle_id = 0  # random mode: άλλη μάχη στο επόμενο restore
             await utils.random_sleep(restores)
 
-        await utils.remove_command(ctx, "auto", "fight")
+        utils.remove_finished_command(ctx)
 
     # @command(name="BO")
     async def battle_order(self, ctx: Context, battle: Id, side: Side, key: Optional[int] = 0, *, nick: IsMyNick):
@@ -283,19 +309,9 @@ class War(Cog):
                 return False
 
         # 3. Health check
-        health_text = tree.xpath('//span[@id="actualHealth"]/text()')
-        health = float(health_text[0]) if health_text else 100.0
-        required_hp = 50 - ticket_quality * 10
-        if health < required_hp:
-            food_storage, gift_storage = utils.get_storage(tree)
-            food_limit, gift_limit = utils.get_limits(tree)
-            if food_limit and food_storage:
-                await self.bot.get_content(f"{base_url}Eat.html", data={'quality': 5})
-            elif gift_limit and gift_storage:
-                await self.bot.get_content(f"{base_url}gift.html", data={'quality': 5})
-            else:
-                await ctx.reply(f"**{nick}** ERROR: no health / limits.")
-                return False
+        if not await self.restore_for_travel(base_url, tree, ticket_quality):
+            await ctx.reply(f"**{nick}** ERROR: no health / limits.")
+            return False
 
         # 4. Travel payload
         payload = {
@@ -314,78 +330,160 @@ class War(Cog):
         return True
         
     @commands.command(aliases=["ttravel"])
-    async def tfarm(self, ctx, num_travels: int, ticket_quality: Optional[int] = 5, *, nick: str):
+    async def tfarm(self, ctx, num_travels: int, ticket_quality: Optional[int] = 5,
+                    consume: Optional[FoodOrGift] = None, *, nick: str):
         """
         Τυχαίες μεταφορές σε διαφορετικά regions (χωρίς διπλές).
-        Χρήση: .tfarm <num_travels> <ticket_quality> <nick>
-        Παράδειγμα: .tfarm 10 5 Kostas
+        Χρήση: .tfarm <num_travels> <ticket_quality> [food/gift] <nick>
+        Χωρίς food/gift τρώει food και μετά gift. Με food ή gift τρώει ΜΟΝΟ αυτό.
+        Παράδειγμα: .tfarm 10 1 gift Kostas
         """
         if not (1 <= ticket_quality <= 5):
             await ctx.reply(f"**{nick}** ERROR: ticket_quality must be between 1-5.")
             return
 
-        all_regions = list(range(1, 301))
-        visited = set()
+        # Όλα γίνονται με clicks στο travel.html (λίστες χωρών/regions της σελίδας), οπότε δουλεύει σε κάθε server
         base_url = f"https://{ctx.channel.name}.e-sim.org/"
+        driver = self.bot.browser_window
+        visited = set()
         travels_done = 0
 
-        while travels_done < num_travels:
-            available = [r for r in all_regions if r not in visited]
-            if not available:
-                await ctx.send(f"**{nick}** No more unique regions left to travel.")
+        while travels_done < num_travels and not utils.should_break(ctx):
+            await self.bot.get_content(f"{base_url}travel.html")
+            await sleep(uniform(1, 2))
+
+            # 1. Ticket (μόνο όσα έχεις στο storage)
+            tickets = {int(o.get_attribute("data-ticket-quality")): o for o in
+                       driver.find_elements(By.CSS_SELECTOR, "#travelListDropdown > .option") if self.is_active(o)}
+            if not tickets:
+                await ctx.send(f"**{nick}** ERROR: no tickets in storage. Stopping tfarm.")
+                break
+            ticket = ticket_quality if ticket_quality in tickets else min(tickets)
+
+            # 2. Food / gift αν δεν φτάνει το health
+            ok, ate = await self.eat_on_travel_page(ticket, consume)
+            if not ok:
+                await ctx.send(f"**{nick}** ERROR: no health / {consume or 'food/gift'} limits. Stopping tfarm.")
                 break
 
-            region_id = random.choice(available)
-            tree = await self.bot.get_content(f"{base_url}region.html?id={region_id}", return_tree=True)
-            country_id = tree.xpath('//form[contains(@action,"travel.html")]//input[@name="countryId"]/@value')
-            region_id_hidden = tree.xpath('//form[contains(@action,"travel.html")]//input[@name="regionId"]/@value')
-            redirect_url = tree.xpath('//form[contains(@action,"travel.html")]//input[@name="redirectUrl"]/@value')
+            # 3. Τυχαία χώρα -> τυχαίο region
+            target = None
+            countries = driver.find_elements(By.CSS_SELECTOR, "#countryListDropdown > .option")
+            shuffle(countries)
+            for country in countries[:20]:
+                old_regions = driver.find_elements(By.CSS_SELECTOR, "#regionListDropDown > .option")
+                await self.pick_dropdown_option("travelSelectedCountry", country)
+                try:  # περιμένουμε να φορτώσει η λίστα με τα regions της χώρας
+                    if old_regions:
+                        WebDriverWait(driver, 10).until(EC.staleness_of(old_regions[0]))
+                except TimeoutException:
+                    pass
+                await sleep(uniform(0.5, 1))
+                regions = [o for o in driver.find_elements(By.CSS_SELECTOR, "#regionListDropDown > .option")
+                           if self.is_active(o) and o.get_attribute("data-region-id") not in visited]
+                if regions:
+                    target = random.choice(regions)
+                    break
+            if not target:
+                await ctx.send(f"**{nick}** ERROR: no region found to travel to. Stopping tfarm.")
+                break
+            region_id = target.get_attribute("data-region-id")
+            region_name = " ".join(target.get_attribute("textContent").split())
+            await self.pick_dropdown_option("travelSelectedRegion", target)
+            await sleep(uniform(0.5, 1))
 
-            if not (country_id and region_id_hidden and redirect_url):
-                await ctx.send(f"**{nick}** Already in region {region_id}, trying another...")
-                await asyncio.sleep(0.1)
-                continue
+            # 4. Ticket + Travel
+            ticket_option = driver.find_element(
+                By.CSS_SELECTOR, f'#travelListDropdown > .option[data-ticket-quality="{ticket}"]')
+            await self.pick_dropdown_option("travelSelectedTicket", ticket_option)
+            await sleep(uniform(0.5, 1))
+            # η απάντηση του game μπαίνει στο #travelReload ("You have moved to ..." ή μήνυμα λάθους)
+            travel_box = driver.find_element(By.ID, "travelReload")
+            before = travel_box.get_attribute("textContent")
+            ActionChains(driver).move_to_element(driver.find_element(By.ID, "travelButton")).click().perform()
+            try:
+                WebDriverWait(driver, 20).until(
+                    lambda d: d.find_element(By.ID, "travelReload").get_attribute("textContent") != before)
+            except TimeoutException:
+                pass
+            answer = " ".join(driver.find_element(By.ID, "travelReload").get_attribute("textContent").split())
+            await sleep(uniform(1, 2))
 
-            tickets_qualities = [int(x) for x in tree.xpath('//select[@id="ticketQuality"]/option/@value')] or [6]
-            ticket_use = ticket_quality if ticket_quality in tickets_qualities else min(tickets_qualities)
-
-            health_text = tree.xpath('//span[@id="actualHealth"]/text()')
-            health = float(health_text[0]) if health_text else 100.0
-            required_hp = 50 - ticket_use * 10
-
-            if health < required_hp:
-                food_storage, gift_storage = utils.get_storage(tree)
-                food_limit, gift_limit = utils.get_limits(tree)
-                if food_limit and food_storage:
-                    await self.bot.get_content(f"{base_url}Eat.html", data={'quality': 5})
-                elif gift_limit and gift_storage:
-                    await self.bot.get_content(f"{base_url}gift.html", data={'quality': 5})
-                else:
-                    await ctx.send(f"**{nick}** ERROR: no health / limits. Stopping tfarm.")
-                    break  # Τερματισμός
-
-            payload = {
-                'countryId': country_id[0],
-                'regionId': region_id_hidden[0],
-                'ticketQuality': ticket_use,
-                'redirectUrl': redirect_url[0],
-            }
-
-            await self.bot.get_content(f"{base_url}region.html?id={region_id}")
-            url = await self.bot.get_content(f"{base_url}travel.html", data=payload)
+            # 5. Έλεγχος ότι άλλαξε η τοποθεσία (sidebar Location)
+            await self.bot.get_content(f"{base_url}travel.html")
+            location = driver.find_element(
+                By.XPATH, "//*[contains(text(), 'Location')]/following::a[contains(@href, 'region.html?id=')][1]")
+            if utils.get_id(location.get_attribute("href")) != region_id:
+                game_says = answer[:200] if "moved to" not in answer.lower() else "no answer from the game"
+                await ctx.send(f"**{nick}** ERROR: travel to {region_name} ({region_id}) did not happen "
+                               f"(game says: {game_says}). Stopping tfarm.")
+                break
 
             visited.add(region_id)
             travels_done += 1
+            ate = f" (ate: {', '.join(ate)})" if ate else ""
+            await ctx.send(f"**{nick}** Travel {travels_done}/{num_travels} -> {region_name} "
+                           f"(Q{ticket}){ate} <{base_url}region.html?id={region_id}>")
+            await sleep(uniform(0.5, 1.5))
 
-            await asyncio.sleep(random.uniform(0.5, 1.5))
-            await ctx.send(f"**{nick}** Travel {travels_done}/{num_travels} -> <{url}>")
+    @staticmethod
+    def is_active(option) -> bool:
+        classes = option.get_attribute("class") or ""
+        return "disabled" not in classes and "notActive" not in classes
 
+    async def pick_dropdown_option(self, selected_id: str, option):
+        """Ανοίγει το dropdown του travel.html (hover) και κάνει click στην επιλογή."""
+        driver = self.bot.browser_window
+        ActionChains(driver).move_to_element(driver.find_element(By.ID, selected_id)).perform()
+        await sleep(uniform(0.5, 1))
+        # οι λίστες έχουν scroll, οπότε scrollIntoView + click μέσω JS (τρέχει το onclick της σελίδας)
+        driver.execute_script("arguments[0].scrollIntoView({block: 'nearest'}); arguments[0].click();", option)
 
-    @classmethod
-    def convert_to_dict(cls, s):
-        """convert to dict"""
-        return dict([a.split("=") for a in s.split("&")])
+    async def eat_on_travel_page(self, ticket_quality: int, only: Optional[str] = None) -> (bool, list):
+        """
+        Στο travel.html: τρώει Q5 food (ή Q5 gift) με clicks μέχρι να φτάσει το health για το ticket
+        (Q1 = 40HP, Q5 = 0HP). only="food"/"gift" = τρώει μόνο αυτό. Επιστρέφει (ok, τι έφαγε).
+        """
+        driver = self.bot.browser_window
+        required_hp = 50 - ticket_quality * 10
+        text = lambda css: driver.find_element(By.CSS_SELECTOR, css).get_attribute("textContent").strip()
+        number = lambda css: float(text(css) or 0)
+        ate = []
+        for _ in range(5):
+            health = number("#actualHealth")
+            if health >= required_hp:
+                return True, ate
+            if only != "gift" and number(".foodLimit") > 0 and number("#foodContainer #sfoodQ5") > 0:
+                kind = "food"
+            elif only != "food" and number(".giftLimit") > 0 and number("#foodContainer #sgiftQ5") > 0:
+                kind = "gift"
+            else:
+                return False, ate
 
+            # διάλεξε food/gift από τη λίστα και πάτα το (όπως με το χέρι)
+            if driver.find_element(By.ID, "selectedFood").get_attribute("data-id") != f"s{kind}Q5":
+                driver.find_element(By.ID, "foodSelectable").click()
+                await sleep(uniform(0.5, 1))
+                driver.find_element(By.CSS_SELECTOR, f'#foodContainer .consumableForHealth[data-id="s{kind}Q5"]').click()
+                await sleep(uniform(0.5, 1))
+            driver.find_element(By.ID, "selectedFood").click()
+            ate.append(kind)
+            await sleep(2)
+            if number("#actualHealth") <= health:  # δεν άλλαξε το health -> κάτι πήγε στραβά
+                return False, ate
+        return number("#actualHealth") >= required_hp, ate
+
+    async def restore_for_travel(self, base_url: str, tree, ticket_quality: int) -> bool:
+        """
+        Για το fly: αν δεν φτάνει το health, πάει στο travel.html και τρώει food/gift με clicks.
+        (Το region.html δεν έχει πλέον food/gift/limits.)
+        """
+        health_text = tree.xpath('//span[@id="actualHealth"]/text()')
+        if (float(health_text[0]) if health_text else 100.0) >= 50 - ticket_quality * 10:
+            return True
+        await self.bot.get_content(f"{base_url}travel.html")
+        ok, _ = await self.eat_on_travel_page(ticket_quality)
+        return ok
 
     @classmethod
     def convert_to_dict(cls, s):
@@ -447,35 +545,40 @@ class War(Cog):
         driver = self.bot.browser_window
         fight_container = driver.find_element(By.ID, "fightMainColumn")
 
-        # Select weapon
+        # Select weapon (μόνο αν δεν είναι ήδη επιλεγμένο)
         weapon_container = fight_container.find_element(By.ID, "weaponContainer")
-        weapon_container.find_element(By.ID, "selectWeaponButton").click()
-        weapon_list = weapon_container.find_elements(By.CLASS_NAME, "consumableWeapon")
-        for weapon in weapon_list:
-            quality = weapon.get_attribute("data-quality")
-            if quality == str(weapon_quality):
-                weapon.click()
+        for weapon in weapon_container.find_elements(By.CLASS_NAME, "consumableWeapon"):
+            if weapon.get_attribute("data-quality") == str(weapon_quality):
+                if "active" not in (weapon.get_attribute("class") or ""):
+                    # JS click: το βελάκι καλύπτεται από το fightMainColumn
+                    driver.execute_script("arguments[0].click();",
+                                          weapon_container.find_element(By.ID, "selectWeaponButton"))
+                    driver.execute_script("arguments[0].click();", weapon)
+                break
 
-        # Select side
-        side_container = driver.find_element(By.CLASS_NAME, "sideContainer")
-        sides = side_container.find_elements(By.CLASS_NAME, "sides")
-        _side = None
-        for _side in sides:
-            if _side.get_attribute("id").replace("Side", "") == side and _side.is_displayed():
-                _side.click()
+        # Select side: η σελίδα δείχνει μόνο το κουμπί της πλευράς που είσαι.
+        # Στα RW υπάρχει το εικονίδιο ⇄ (.changeSide) για αλλαγή πλευράς.
+        if self.visible_fight_side() != side:
+            change_side = driver.find_elements(By.CSS_SELECTOR, ".changeSide")
+            if change_side:
+                ActionChains(driver).move_to_element(change_side[0]).click().perform()
+                WebDriverWait(driver, 5).until(lambda d: self.visible_fight_side() == side)
+            if self.visible_fight_side() != side:
+                return f"ERROR: can't fight for the {side} from your current location"
 
-        # Select hit type (Normal/Berserk)
-        hit_type = "Berserk" if berserk else "Normal"
-        if not _side:
-            print("ERROR: couldn't find side")
-            return
-        if not _side.is_displayed():  # e-sim show only defender checkbox if you can't choose side
-            side = "defender"
-        fight_btn = driver.find_element(By.ID, "fightButton" + ('0' if side == 'defender' else '1'))
-        checkbox = fight_container.find_element(By.ID, f"{side}{hit_type}Checkbox")
-        if fight_btn.get_attribute("data-hit-type") != hit_type:
+        # Μόνο Berserk (x5)
+        checkbox = fight_container.find_element(By.ID, f"{side}BerserkCheckbox")
+        if not checkbox.is_selected():
             driver.execute_script("arguments[0].click();", checkbox)  # click() didn't work
-        self.setup_health(food_or_gift)
+
+    def visible_fight_side(self) -> Optional[str]:
+        """Ποιο κουμπί Fight δείχνει η σελίδα: αριστερά = defender, δεξιά = attacker."""
+        driver = self.bot.browser_window
+        for side, box_id in (("defender", "fightButtonLeftSide"), ("attacker", "fightButtonRightSide")):
+            box = driver.find_elements(By.ID, box_id)
+            if box and "hidden" not in (box[0].get_attribute("class") or ""):
+                return side
+        return None
 
     def select_berserk_once(self, side: str):
         """Επιλέγει το Χ5 (Berserk) μόνο μία φορά πριν ξεκινήσει το fight loop."""
@@ -490,37 +593,30 @@ class War(Cog):
             print(f"[WARNING] Berserk checkbox not found for {side}")
 
 
-    def click_fight(self, side):
+    def click_fight(self, side) -> bool:
+        """
+        Click στο κουμπί Fight. Αν υπάρχει popup, το click το κλείνει και ξαναδοκιμάζει.
+        Σταματάει μόλις έρθει η απάντηση του χτυπήματος (άρα 1 χτύπημα ανά κλήση).
+        """
         driver = self.bot.browser_window
-        from selenium.webdriver import ActionChains
-
         side_str = "Left" if side == "defender" else "Right"
-
-        attempts = 0
-        while attempts < 5:
-            attempts += 1
-
-        # 1. Βρες fight button
+        # marker: η σελίδα αντικαθιστά το "#fightResponse > div" με την απάντηση, οπότε όταν χαθεί ήρθε
+        driver.execute_script("""
+            const box = document.querySelector('#fightResponse > div');
+            if (box) box.insertAdjacentHTML('beforeend', '<span id="botWaitingForHit"></span>');""")
+        for attempt in range(5):
             try:
                 fight_button = driver.find_element(By.ID, f"fightButton{side_str}Side")
-            except NoSuchElementException:
-                fight_button = driver.find_element(By.ID, "fightButtonLeftSide")
-
-        # 2. Αν είναι ορατό, κάνε click
-            if fight_button.is_displayed():
-                try:
-                    actions = ActionChains(driver)
-                    actions.move_to_element(fight_button).pause(random.uniform(0.1, 0.3)).click().perform()
-                    print(f"[DEBUG] Clicking fight button ({side}) attempt {attempts}")
-                except Exception as e:
-                    print(f"[DEBUG] Click failed: {e}")
-
-            # συνέχισε αδιάφορα, ακόμα κι αν popup εμφανιστεί
-                delay = random.uniform(0.2, 0.5)
-                time.sleep(delay)
-            else:
-                print(f"[DEBUG] Fight button not displayed, attempt {attempts}")
-                time.sleep(random.uniform(0.5, 1))
+                ActionChains(driver).move_to_element(fight_button).pause(uniform(0.05, 0.15)).click().perform()
+            except Exception as e:
+                print(f"[DEBUG] Click failed (attempt {attempt + 1}): {e}")
+            try:
+                WebDriverWait(driver, 3, poll_frequency=0.05).until(
+                    lambda d: not d.find_elements(By.ID, "botWaitingForHit"))
+                return True
+            except TimeoutException:
+                pass  # μάλλον το click έκλεισε popup -> ξαναπάτα
+        return False
 
 
     @command(aliases=["fight_fast"])
@@ -560,7 +656,10 @@ class War(Cog):
         t2 = api["hoursRemaining"] * 3600 + api["minutesRemaining"] * 60 + api["secondsRemaining"] < uniform(60, 120)
 
         tree = await self.bot.get_content(link, return_tree=True)
-        self.setup_fight(weapon_quality, side, consume_first, berserk=(dmg >= 5))
+        setup_error = self.setup_fight(weapon_quality, side, consume_first)
+        if setup_error:
+            await ctx.send(f"**{nick}** {setup_error}")
+            return True, 0
         try:
             food_storage, gift_storage = utils.get_storage(tree)
         except IndexError:
@@ -583,6 +682,7 @@ class War(Cog):
         msg = await ctx.send(output)
         damage_done = 0
         update = 0
+        no_answer = 0
         if ctx.invoked_with.lower() != "fight_fast":
             await sleep(uniform(3, 7))
         hits_or_dmg = "hits" if dmg <= 1000 else "dmg"
@@ -615,7 +715,7 @@ class War(Cog):
         # Επιστρέφουμε στη μάχη
                             driver.get(link)
                             tree = fromstring(driver.page_source)
-                            self.setup_health(consume_first)
+                            self.setup_fight(weapon_quality, side, consume_first)
                             continue  # συνεχίζουμε το fight loop
 
                         except NoSuchElementException:
@@ -624,10 +724,7 @@ class War(Cog):
 
                     else:
                         break
-                restore_health_msg = self.restore_health(tree, consume_first)
-                if restore_health_msg:
-                    output += restore_health_msg
-                    break
+                # αλλιώς: το game τρώει food/gift μόνο του όταν πατάμε Fight
             try:
                 berserk_checkbox = driver.find_element(By.ID, f"{side}BerserkCheckbox")  # attackerBerserkCheckbox / defenderBerserkCheckbox
                 if not berserk_checkbox.is_selected():  # αν δεν είναι ήδη επιλεγμένο
@@ -635,39 +732,45 @@ class War(Cog):
                     print(f"[DEBUG] Χ5 selected for side {side}")
             except NoSuchElementException:
                 print(f"[DEBUG] Berserk checkbox for side {side} not found")
-            self.click_fight(side)
+            if not self.click_fight(side):
+                no_answer += 1
+                if no_answer >= 3:
+                    await ctx.send(f"**{nick}** ERROR: the fight button doesn't respond. Stopping.")
+                    break
+                continue
+            no_answer = 0
             tree = fromstring(self.bot.browser_window.page_source)
-            if utils.get_health(tree) is None:
-                if "Slow down a bit!" in tree.text_content():
-                    output += "\nSlow down!"
-                    await sleep(uniform(0.35, 1))
-                    continue
-                elif "No health left" in tree.text_content():
-                    continue
-                elif "Round is closed" in tree.text_content():
+            # Η απάντηση του χτυπήματος είναι στο #fightResponse: αν έχει DamageDone -> πέτυχε
+            response = tree.xpath('//*[@id="fightResponse"]')
+            response_text = response[0].text_content() if response else ""
+            damage = tree.xpath('//*[@id="fightResponse"]//*[@id="DamageDone"]')
+            if not damage:
+                if "Slow down" in response_text:
+                    continue  # δεν μετράει ως χτύπημα, ξαναδοκίμασε
+                elif "Round is closed" in response_text:
                     output += "\nRound is over."
                     if continue_next_round:
                         await sleep(uniform(15, 25))
                         continue
                     else:
                         break
+                elif "No health left" in response_text:
+                    output += "\nNo health left."
+                    break
                 else:
-                    res = tree.xpath('//*[@id="fightResponse"]//div//div//span[1]/text()')
-                    await ctx.send(f"**{nick}** ERROR: {' '.join(res).strip()}"[:3900])
+                    await ctx.send(f"**{nick}** ERROR: {' '.join(response_text.split())}"[:1900])
                     break
             if weapon_quality:
-                wep -= 5 if dmg >= 5 else 1
-            if dmg < 5:
-                damage_done += 1
-            elif dmg <= 1000:
+                wep -= 5
+            if dmg <= 1000:
                 damage_done += 5
             else:
-                damage_done += int(str(tree.xpath('//*[@id="DamageDone"]')[0].text).replace(",", ""))
+                damage_done += int(re.sub(r"\D", "", damage[0].text_content().split("+")[0]) or 0)
             update += 1
             if t2 or uniform(1, 100) < 20:  # 20% chance to sleep less if not t2
-                await sleep(uniform(0.5, 0.8))
+                await sleep(uniform(0.05, 0.12))
             else:
-                await sleep(uniform(0.5, 0.8))
+                await sleep(uniform(0.05, 0.12))
 
             if update % 4 == 0:
                 # dmg update every 4 berserks.
@@ -1019,7 +1122,7 @@ class War(Cog):
                     damage_done += 5
                 else:
                     damage_done += int(str(tree.xpath('//*[@id="DamageDone"]')[0].text).replace(",", ""))
-                await sleep(uniform(0, 1))
+                await sleep(uniform(0, 0.2))
 
             await ctx.send(f"**{nick}** done {damage_done:,} {hits_or_dmg} at <{link}>")
             if not utils.should_break(ctx):
@@ -1057,101 +1160,179 @@ class War(Cog):
         await utils.remove_command(ctx, "auto", "motivate")
 
     @command()
-    async def motivate(self, ctx, *, nick):
+    async def motivate(self, ctx, item: Optional[MotivateType] = None, *, nick):
         """
-        Motivate new citizens with Q1 weapon, Q3 food, Q3 gift, and bonus.
-        Updated for new interface + skip if fail + delay 1-3 sec.
+        Motivate 5 new citizens (newest first).
+        item: weapons (Q1) / food (Q3) / gift (Q3) / tickets (Q1) / any, ή με κόμμα π.χ. food,gift (σειρά προτίμησης).
+        Χωρίς item = any (food, gift, tickets, weapons).
+        Παράδειγμα: .motivate food Kostas
         """
         server = ctx.channel.name
         base_url = f"https://{server}.e-sim.org/"
-
-        # ----------- Check MU storage -----------
-        def get_storage(tree):
-            products = utils.get_products(tree)
-            storage = {}
-            if products.get("Q1 Weapon", 0) >= 15:
-                storage["Q1 wep"] = 1
-            if products.get("Q3 Food", 0) >= 10:
-                storage["Q3 food"] = 2
-            if products.get("Q3 Gift", 0) >= 5:
-                storage["Q3 gift"] = 3
-            return storage
-
-        tree = await self.bot.get_content(base_url + 'storage.html?storageType=PRODUCT', return_tree=True)
-        storage = get_storage(tree)
-        if not storage:
-            await ctx.send(f"**{nick}** ERROR: Not enough items in MU storage (need Q1 wep / Q3 food / Q3 gift)")
+        # ----------- Ποιους citizens θα δοκιμάσει -----------
+        # Πρώτα όσους δείχνει η λίστα New Citizens (δεν έχει τους "too old"), μετά ανά id προς τα πίσω.
+        # Αν η λίστα είναι κενή σε κάποιον server: newest id από το API και προς τα πίσω.
+        try:
+            listed = await self.citizens_from_list(base_url)
+            start = (min(listed) - 1) if listed else await self.find_newest_citizen(base_url)
+        except Exception as e:
+            await ctx.send(f"**{nick}** ERROR: couldn't find the newest citizens ({e})")
             return
+        newest = listed[0] if listed else start
+        await ctx.send(f"**{nick}** Newest citizen: <{base_url}profile.html?id={newest}>. "
+                       f"{len(listed)} in the New Citizens list, then going backwards by id...")
+        candidates = chain(listed, range(start, 0, -1))
 
-        # ----------- Find newest citizen -----------
-        new_citizens_tree = await self.bot.get_content(base_url + 'newCitizens.html?countryId=0', return_tree=True)
-        citizen_id = int(utils.get_ids_from_path(new_citizens_tree, "//tr[2]//td[1]/div/a")[0])
+        types = item or ["FOOD", "GIFTS", "TICKETS", "WEAPONS"]
+        sent_count, checked, failed_in_a_row = 0, [], 0
+        max_checks = 300  # πόσους citizens ελέγχουμε το πολύ
 
-        sent_count, checked = 0, []
-        should_exit = False
+        for citizen_id in islice(candidates, max_checks):
+            if sent_count >= 5 or utils.should_break(ctx):
+                break
+            profile = f"<{base_url}profile.html?id={citizen_id}>"
+            for attempt in range(2):  # π.χ. η σελίδα δεν φόρτωσε: ξαναδοκίμασε τον ίδιο citizen μία φορά
+                try:
+                    result = await self.motivate_citizen(base_url, citizen_id, types)
+                    break
+                except Exception as e:
+                    result = {"status": "error", "msg": str(e).strip().splitlines()[0][:200]}
+                    await sleep(uniform(3, 6))
 
-        # Map κουμπιών σε XPaths
-        button_xpaths = {
-            "Q1 wep": "/html/body/div[1]/div[2]/div[5]/main/div[2]/form[1]/button",
-            "Q3 food": "/html/body/div[1]/div[2]/div[5]/main/div[2]/form[2]/button",
-            "Q3 gift": "/html/body/div[1]/div[2]/div[5]/main/div[2]/form[3]/button",
-            "Bonus":   "/html/body/div[1]/div[2]/div[5]/main/div[2]/form[4]/button",
-        }
+            if result["status"] == "sent":
+                sent_count += 1
+                failed_in_a_row = 0
+                checked.append(f"✅ Sent {result['type']} to {result['name']} {profile}")
+            elif result["status"] == "limit":
+                checked.append(f"🛑 {result['msg']}")
+                break
+            elif result["status"] == "failed":
+                failed_in_a_row += 1
+                checked.append(f"❌ Couldn't motivate {result['name']} {profile}: {result['msg']}")
+            elif result["status"] == "error":
+                checked.append(f"⚠️ Error for {profile}: {result['msg']}")
+            # "skip" = too old / already motivated -> χωρίς μήνυμα
 
-        while not should_exit:
-            url = f"{base_url}motivateCitizen.html?id={citizen_id}"
-            try:
-                motivation_sent = False
-                for item, xpath in button_xpaths.items():
-                    if item != "Bonus" and item not in storage:
-                        continue
-                    try:
-                        await self.bot.get_content(url, data={
-                            "click": True,
-                            "find_by": "xpath",
-                            "element": xpath
-                        }, return_tree=False)
+            if failed_in_a_row >= 3:
+                checked.append("Stopping: 3 failures in a row (daily limit reached or missing items?)")
+                break
 
-                        checked.append(f"✅ Sent {item} to <{base_url}profile.html?id={citizen_id}>")
-                        motivation_sent = True
-                        sent_count += 1
-                        break
-                    except Exception as e:
-                        checked.append(f"⚠️ Failed {item} for citizen {citizen_id}: {str(e)}")
-                        continue
-
-                if not motivation_sent:
-                    checked.append(f"❌ Nothing sent to <{base_url}profile.html?id={citizen_id}>")
-
-            except Exception as e:
-                checked.append(f"⚠️ Error while trying to motivate citizen {citizen_id}: {str(e)}")
-
-            # ΠΡΟΧΩΡΑ στον επόμενο citizen ΠΑΝΤΑ
-            citizen_id -= 1
-
-            # Delay 1–3 sec για πιο φυσικό ρυθμό
-            await sleep(uniform(1, 3))
-
-            # Κάθε 10 πολίτες στέλνουμε report
-            if citizen_id % 10 == 0 and checked:
+            if len(checked) >= 5:
                 await ctx.send(f"**{nick}**\n" + "\n".join(checked))
                 checked.clear()
+            # πιο αργά μετά από motivation, πιο γρήγορα όταν απλώς προσπερνάει
+            await sleep(uniform(4, 9) if result["status"] == "sent" else uniform(1.5, 3.5))
 
-            if sent_count >= 5:
-                await ctx.send(f"**{nick}** ✅ Motivated 5 citizens successfully.")
-                break
+        if checked:
+            await ctx.send(f"**{nick}**\n" + "\n".join(checked))
+        await ctx.send(f"**{nick}** Motivated {sent_count} citizens.")
 
-            if utils.should_break(ctx):
-                should_exit = True
-                break
+    async def citizen_exists(self, base_url: str, citizen_id: int) -> bool:
+        """
+        Ελέγχει στο apiCitizenById.html αν υπάρχει ο citizen. Χρησιμοποιεί το δεύτερο (incognito) παράθυρο,
+        όπως όλα τα api του bot, ώστε να μη φαίνεται στο παράθυρο του λογαριασμού.
+        """
+        driver = self.bot.incognito_window
+        for _ in range(4):
+            await sleep(uniform(0.4, 1.2))
+            driver.get(f"{base_url}apiCitizenById.html?id={citizen_id}")
+            body = driver.find_element(By.TAG_NAME, "body").text
+            if '"login"' in body:
+                return True
+            if "No citizen" in body:
+                return False
+            await sleep(1.5)
+        raise ConnectionError(f"API did not answer for id {citizen_id}")
 
-        # ----------- Update limits -----------
-        tree = await self.bot.get_content(base_url + 'storage.html?storageType=PRODUCT', return_tree=True)
-        food_limit, gift_limit = utils.get_limits(tree)
-        await utils.update_info(server, nick, {"limits": f"{food_limit}/{gift_limit}"})
+    async def citizens_from_list(self, base_url: str) -> list:
+        """Τα ids της λίστας New Citizens, νεότερος πρώτος (τα ονόματα έχουν onmousedown="...('profile?id=123', event)")."""
+        tree = await self.bot.get_content(f"{base_url}newCitizens.html?countryId=0", return_tree=True)
+        await sleep(uniform(1, 3))
+        ids = {int(x) for link in tree.xpath('//table//a[contains(@onmousedown, "profile") or contains(@href, "profile")]')
+               for x in re.findall(r"id=(\d+)", link.get("onmousedown", "") + link.get("href", ""))}
+        return sorted(ids, reverse=True)
 
+    async def find_newest_citizen(self, base_url: str) -> int:
+        """Binary search στα citizen ids (τα ids δίνονται με τη σειρά)."""
+        lo, hi = 1, 1024
+        while await self.citizen_exists(base_url, hi):
+            lo, hi = hi, hi * 2
+        while hi - lo > 1:
+            middle = (lo + hi) // 2
+            if await self.citizen_exists(base_url, middle):
+                lo = middle
+            else:
+                hi = middle
+        # σε περίπτωση κενών στα ids, κοίτα λίγο πιο πάνω
+        i = 1
+        while i <= 30:
+            if await self.citizen_exists(base_url, lo + i):
+                lo, i = lo + i, 1
+            else:
+                i += 1
+        return lo
 
+    async def motivate_citizen(self, base_url: str, citizen_id: int, types: list) -> dict:
+        """
+        Ανοίγει το motivateCitizen.html και πατάει Motivate στο πρώτο διαθέσιμο type.
+        status: sent / skip (too old / ήδη motivated) / limit / failed
+        """
+        driver = self.bot.browser_window
+        url = f"{base_url}motivateCitizen.html?id={citizen_id}"
 
+        def read_page():
+            text = " ".join(driver.find_element(By.TAG_NAME, "main").get_attribute("textContent").split())
+            text = text.split("Your storage")[0]
+            name = re.search(r"^Motivate (.+?) (This citizen|\d+x)", text)
+            buttons = {}  # μόνο φόρμες με κουμπί (όσες έχουν σταλεί δεν έχουν)
+            for form in driver.find_elements(By.CSS_SELECTOR, "main form"):
+                type_input = form.find_elements(By.CSS_SELECTOR, "input[name='type']")
+                button = form.find_elements(By.TAG_NAME, "button")
+                if type_input and button:
+                    buttons[type_input[0].get_attribute("value")] = button[0]
+            return (name.group(1) if name else str(citizen_id)), text, buttons
+
+        async def load_page():
+            """Ανοίγει τη σελίδα και περιμένει να φορτώσει πλήρως (το get_content περιμένει μόνο το <body>)."""
+            for _ in range(3):
+                await self.bot.get_content(url)
+                try:
+                    WebDriverWait(driver, 10).until(
+                        lambda d: d.execute_script("return document.readyState") == "complete"
+                        and d.find_elements(By.TAG_NAME, "main"))
+                    return read_page()
+                except TimeoutException:
+                    await sleep(uniform(2, 4))
+            raise TimeoutError(f"the motivate page didn't load")
+
+        name, text, buttons = await load_page()
+        if not buttons or "You already motivated" in text:
+            return {"status": "skip", "name": name}
+
+        msgs = []
+        for type_ in types:
+            if type_ not in buttons:
+                continue
+            await sleep(uniform(1.5, 3.5))  # "διαβάζει" τη σελίδα πριν πατήσει
+            ActionChains(driver).move_to_element(buttons[type_]).pause(uniform(0.3, 0.8)).click().perform()
+            # περίμενε να φύγει από τη σελίδα (profile.html = επιτυχία, motivateCItizen.html = error)
+            try:
+                WebDriverWait(driver, 15).until(
+                    lambda d: d.current_url != url and d.execute_script("return document.readyState") == "complete")
+            except TimeoutException:
+                pass
+            if "profile.html" in driver.current_url:
+                return {"status": "sent", "type": type_, "name": name}
+            errors = driver.find_elements(By.CSS_SELECTOR, "#newError, .newError")
+            error = " ".join(errors[0].get_attribute("textContent").split()) if errors else "unknown error"
+            if "too many motivations" in error.lower():
+                return {"status": "limit", "name": name, "msg": error}
+            msgs.append(f"{type_}: {error[:120]}")
+            await sleep(uniform(1, 2))
+            name, text, buttons = await load_page()
+            if "You already motivated" in text:  # τελικά στάλθηκε
+                return {"status": "sent", "type": type_, "name": name}
+        return {"status": "failed", "name": name, "msg": " | ".join(msgs) or "no motivate forms"}
 
     # @command(aliases=["dow", "mpp"])
     async def attack(self, ctx: Context, country_or_region_id: Id, delay: Optional[int] = 0, *, nick: IsMyNick):

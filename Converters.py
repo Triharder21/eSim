@@ -38,6 +38,30 @@ class Side(Converter, str):
         raise BadArgument(f'ERROR: "side" must be "defender" or "attacker" (not {side})')
 
 
+class FoodOrGift(Converter, str):
+    """food / gift (για να καταναλώνει μόνο αυτό)"""
+
+    async def convert(self, ctx: Context, item: str) -> str:
+        item = item.lower()
+        if item in ("food", "gift", "gifts"):
+            return "gift" if item.startswith("gift") else "food"
+        raise BadArgument(f"Wrong item (`{item}`). Use food / gift")
+
+
+class MotivateType(Converter, str):
+    """Motivate package: weapons (Q1), food / gift (Q3), tickets (Q1). Comma separated = order to try."""
+    types = {"weapons": "WEAPONS", "weapon": "WEAPONS", "weps": "WEAPONS", "wep": "WEAPONS",
+             "food": "FOOD", "gift": "GIFTS", "gifts": "GIFTS", "tickets": "TICKETS", "ticket": "TICKETS"}
+
+    async def convert(self, ctx: Context, item: str) -> list:
+        if item.lower() in ("any", "all"):
+            return ["FOOD", "GIFTS", "TICKETS", "WEAPONS"]
+        parts = [x.strip().lower() for x in item.split(",")]
+        if all(x in self.types for x in parts):
+            return [self.types[x] for x in parts]
+        raise BadArgument(f"Wrong motivate type (`{item}`). Use weapons / food / gift / tickets / any")
+
+
 class Quality(Converter, int):
     """Quality Converter"""
 

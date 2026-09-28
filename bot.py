@@ -1,5 +1,7 @@
 """bot.py"""
+import asyncio
 import importlib
+from random import uniform
 import json
 import os
 from datetime import datetime
@@ -80,15 +82,6 @@ async def start() -> None:
         ctx = await bot.get_context(message)
         bot.loop.create_task(ctx.invoke(bot.get_command("auto_motivate"), d["chance_to_skip_a_day"], nick=d["nick"]))
 
-    for d1 in (await utils.find_one("auto", "fight", os.environ['nick'])).values():
-        for d in d1:
-            channel = bot.get_channel(int(d["channel_id"]))
-            message = await channel.fetch_message(int(d["message_id"]))
-            ctx = await bot.get_context(message)
-            bot.loop.create_task(ctx.invoke(
-                bot.get_command("auto_fight"), d["nick"], d["restores"], d["battle_id"],
-                d["side"], d["wep"], d["food"], d["gift"], d["ticket_quality"], d["chance_to_skip_restore"]))
-
     for d1 in (await utils.find_one("auto", "hunt", os.environ['nick'])).values():
         for d in d1:
             channel = bot.get_channel(int(d["channel_id"]))
@@ -119,13 +112,12 @@ async def start() -> None:
 
 def login(server: str) -> None:
     driver = bot.browser_window
-    if driver.current_url == f"https://{server}.e-sim.org/":
-        try:
-            login_button = driver.find_element(By.ID, 'navigateToLogin')
-            if login_button.is_displayed():
-                login_button.click()
-        except Exception:
-            pass
+    try:  # στην αρχική σελίδα η φόρμα εμφανίζεται μετά το κουμπί Login
+        login_button = driver.find_element(By.ID, 'navigateToLogin')
+        if login_button.is_displayed():
+            login_button.click()
+    except Exception:
+        pass
     login_form = driver.find_element(By.CSS_SELECTOR, "form[action='Iogin.html']")
     username_input = login_form.find_element(By.NAME, "login")
     password_input = login_form.find_element(By.NAME, "password")
@@ -138,6 +130,28 @@ def login(server: str) -> None:
     print(datetime.now(), nick, server, url)
     # if "index.html?act=login" not in str(url):
     #     raise ConnectionError(f"{nick} - Failed to login {url}")
+
+
+bot.logged_in_servers = set()
+
+
+async def login_from_homepage(server: str) -> None:
+    """
+    Την πρώτη φορά σε κάθε server: άνοιξε πρώτα την αρχική σελίδα και κάνε login από εκεί,
+    αντί να ανοίξει κατευθείαν π.χ. train.html και να περάσει από SERVER_IS_CLOSED / notLoggedIn.
+    """
+    if server in bot.logged_in_servers:
+        return
+    driver = bot.browser_window
+    driver.get(f"https://{server}.e-sim.org/")
+    WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+    await asyncio.sleep(uniform(1, 2.5))
+    # login form ή κουμπί login -> δεν είμαστε συνδεδεμένοι
+    if driver.find_elements(By.CSS_SELECTOR, "form[action='Iogin.html']") or driver.find_elements(By.ID, "navigateToLogin"):
+        login(server)
+        WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+        await asyncio.sleep(uniform(1.5, 3))
+    bot.logged_in_servers.add(server)
 
 
 strategies = {
@@ -164,6 +178,8 @@ async def get_content(link: str = None, data: dict = None, return_tree: bool = F
     # if server not in driver.window_handles:
     #     driver.execute_script(f"window.open('', '{server}');")
     #     driver.switch_to.window(server)
+    if not incognito and ".e-sim.org" in link:
+        await login_from_homepage(link.split("https://", 1)[1].split(".e-sim.org", 1)[0])
     if driver.current_url != link:
         driver.get(link)
         max_wait = 10
