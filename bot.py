@@ -100,15 +100,6 @@ async def start() -> None:
                 bot.get_command("hunt_battle"), d["nick"], d["link"], d["side"], d["dmg_or_hits_per_bh"],
                 d["weapon_quality"], d["food"], d["gift"], d["start_time"]))
 
-    for d1 in (await utils.find_one("auto", "watch", os.environ['nick'])).values():
-        for d in d1:
-            channel = bot.get_channel(int(d["channel_id"]))
-            message = await channel.fetch_message(int(d["message_id"]))
-            ctx = await bot.get_context(message)
-            bot.loop.create_task(ctx.invoke(
-                bot.get_command("watch"), d["nick"], d["battle"], d["side"], d["start_time"], d["keep_wall"],
-                d["let_overkill"], d["weapon_quality"], d["ticket_quality"], d["consume_first"], d.get("medkits", 0)))
-
 
 def login(server: str) -> None:
     driver = bot.browser_window
@@ -293,7 +284,12 @@ async def get_content(link: str = None, data: dict = None, return_tree: bool = F
 
 
     if "api" in link or "battleScore" in link:
-        api = json.loads(driver.find_element(By.TAG_NAME, 'body').text)
+        # textContent (όχι .text): το .text είναι το "ορατό" κείμενο και χαλάει το JSON (π.χ. battleScore)
+        raw = driver.execute_script("return document.body.textContent")
+        try:
+            api = json.loads(raw)
+        except json.JSONDecodeError:  # κάποια api έχουν κενές τιμές, π.χ. "gearInfo":,
+            api = json.loads(raw.replace('":,', '":null,'))
         if "error" in api:
             raise ConnectionError(api["error"])
         return api if "apiBattles" not in link else api[0]

@@ -331,7 +331,7 @@ class War(Cog):
         
     @commands.command(aliases=["ttravel"])
     async def tfarm(self, ctx, num_travels: int, ticket_quality: Optional[int] = 5,
-                    consume: Optional[FoodOrGift] = None, *, nick: str):
+                    consume: Optional[FoodOrGift] = None, *, nick: IsMyNick):
         """
         Τυχαίες μεταφορές σε διαφορετικά regions (χωρίς διπλές).
         Χρήση: .tfarm <num_travels> <ticket_quality> [food/gift] <nick>
@@ -1160,7 +1160,7 @@ class War(Cog):
         await utils.remove_command(ctx, "auto", "motivate")
 
     @command()
-    async def motivate(self, ctx, item: Optional[MotivateType] = None, *, nick):
+    async def motivate(self, ctx, item: Optional[MotivateType] = None, *, nick: IsMyNick):
         """
         Motivate 5 new citizens (newest first).
         item: weapons (Q1) / food (Q3) / gift (Q3) / tickets (Q1) / any, ή με κόμμα π.χ. food,gift (σειρά προτίμησης).
@@ -1193,7 +1193,8 @@ class War(Cog):
             profile = f"<{base_url}profile.html?id={citizen_id}>"
             for attempt in range(2):  # π.χ. η σελίδα δεν φόρτωσε: ξαναδοκίμασε τον ίδιο citizen μία φορά
                 try:
-                    result = await self.motivate_citizen(base_url, citizen_id, types)
+                    # στη 2η προσπάθεια: αν δείχνει "already motivated", το motivation της 1ης πέρασε -> μετράει
+                    result = await self.motivate_citizen(base_url, citizen_id, types, after_error=attempt > 0)
                     break
                 except Exception as e:
                     result = {"status": "error", "msg": str(e).strip().splitlines()[0][:200]}
@@ -1272,7 +1273,7 @@ class War(Cog):
                 i += 1
         return lo
 
-    async def motivate_citizen(self, base_url: str, citizen_id: int, types: list) -> dict:
+    async def motivate_citizen(self, base_url: str, citizen_id: int, types: list, after_error: bool = False) -> dict:
         """
         Ανοίγει το motivateCitizen.html και πατάει Motivate στο πρώτο διαθέσιμο type.
         status: sent / skip (too old / ήδη motivated) / limit / failed
@@ -1306,6 +1307,8 @@ class War(Cog):
             raise TimeoutError(f"the motivate page didn't load")
 
         name, text, buttons = await load_page()
+        if after_error and "You already motivated" in text:
+            return {"status": "sent", "type": "(confirmed after page error)", "name": name}
         if not buttons or "You already motivated" in text:
             return {"status": "skip", "name": name}
 
@@ -1496,11 +1499,10 @@ class War(Cog):
         if consume_first not in ("food", "gift", "none"):
             return await ctx.send(
                 f"**{nick}** `consume_first` parameter must be food, gift, or none (not {consume_first})")
-        data = {"battle": battle, "side": side, "start_time": start_time, "keep_wall": keep_wall,
-                "let_overkill": let_overkill, "weapon_quality": weapon_quality, "ticket_quality": ticket_quality,
-                "consume_first": consume_first, "medkits": medkits}
+        # Δεν αποθηκεύεται: αν κλείσει το script, σταματάει (όπως το auto_fight).
+        utils.remove_finished_command(ctx)
         ctx.command = f"watch-{ctx.message.id}"
-        await utils.save_command(ctx, "auto", "watch", data)
+        utils.add_command(ctx)  # για να δουλεύει το .cancel watch-<id>
 
         base_url = f"https://{ctx.channel.name}.e-sim.org/"
         api_citizen = await self.bot.get_content(f'{base_url}apiCitizenByName.html?name={nick.lower()}')
@@ -1524,9 +1526,10 @@ class War(Cog):
             hidden_id = tree.xpath("//*[@id='battleRoundId']")[0].value
 
             while not error:
-                # TODO
+                # το live score της μάχης (το ίδιο που φορτώνει η σελίδα), στο δεύτερο παράθυρο
                 battle_score = await self.bot.get_content(
-                    f'{base_url}battleScore.html?id={hidden_id}&at={api_citizen["id"]}&ci={api_citizen["citizenshipId"]}&premium=1')
+                    f'{base_url}battleScore.html?id={hidden_id}&at={api_citizen["id"]}&ci={api_citizen["citizenshipId"]}&premium=1',
+                    incognito=True)
                 if battle_score["remainingTimeInSeconds"] <= 0:
                     break
                 my_side = int(battle_score[f"{side}Score"].replace(",", ""))
@@ -1542,7 +1545,7 @@ class War(Cog):
 
             await utils.idle(self.bot, [battle_link, base_url, base_url + "battles.html"])
 
-        await utils.remove_command(ctx, "auto", "watch")
+        utils.remove_finished_command(ctx)
 
     # @command(aliases=["unwear"])
     async def wear(self, ctx: Context, ids, *, nick: IsMyNick):
