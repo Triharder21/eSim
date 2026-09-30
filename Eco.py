@@ -41,7 +41,7 @@ from discord.ext.commands import Cog, Context, command
 from pytz import timezone
 
 import utils
-from Converters import Country, Id, IsMyNick, Product, Quality
+from Converters import Country, Id, IsMyNick, MotivateType, Product, Quality
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import Select, WebDriverWait
@@ -789,6 +789,23 @@ class Eco(Cog):
         # λάθος (π.χ. no money / no resources) -> σταματάει εδώ, χωρίς νέα προσπάθεια
         result = await self.wait_for_result()
         return "Worked successfully" if result == "done" else f"ERROR: Couldn't work: {result}"
+
+    @command()
+    async def daily(self, ctx: Context, ticket_quality: Optional[int] = 5,
+                    motivate_item: Optional[MotivateType] = None, *, nick: IsMyNick):
+        """Η καθημερινή ρουτίνα ενός λογαριασμού: train + work, μετά motivate (5 citizens).
+        ticket_quality: ticket για να πάει στη δουλειά αν χρειάζεται (default 5).
+        motivate_item: food / gift / tickets / weapons / any ή π.χ. food,gift (default: food, gift, tickets, weapons).
+        Παράδειγμα: .daily 5 food Radical  ή απλά  .daily Radical
+        Τρέχει μόνο στο μηχάνημα του nick (κάθε μηχάνημα κάνει τον δικό του λογαριασμό)."""
+        await ctx.send(f"**{nick}** Starting daily routine: train + work, then motivate. "
+                       f"Cancel with `.cancel daily {nick}`")
+        await ctx.invoke(self.bot.get_command("work"), ticket_quality, nick=nick)
+        if utils.should_break(ctx):
+            return
+        await sleep(uniform(20, 60))  # ανθρώπινη παύση ανάμεσα στις δουλειές
+        await ctx.invoke(self.bot.get_command("motivate"), motivate_item, nick=nick)
+        await ctx.send(f"**{nick}** Daily routine done.")
 
     @command(aliases=["w", "work+"])
     async def work(self, ctx: Context, ticket_quality: Optional[int] = 5, *, nick: IsMyNick):
