@@ -185,8 +185,10 @@ async def get_content(link: str = None, data: dict = None, return_tree: bool = F
     #     driver.switch_to.window(server)
     if not incognito and ".e-sim.org" in link:
         await login_from_homepage(link.split("https://", 1)[1].split(".e-sim.org", 1)[0])
+    navigated = False  # για να μη φορτώνει την ίδια σελίδα 2 φορές (εδώ και στο τέλος)
     if driver.current_url != link:
         driver.get(link)
+        navigated = True
         max_wait = 10
         WebDriverWait(driver, max_wait).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
 
@@ -279,7 +281,7 @@ async def get_content(link: str = None, data: dict = None, return_tree: bool = F
         """
         driver.execute_script(script, link, data)
 
-    else:
+    elif not navigated:  # ήμασταν ήδη σε αυτή τη σελίδα -> ένα refresh για φρέσκα δεδομένα
         driver.get(link)
 
 

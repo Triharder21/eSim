@@ -29,7 +29,7 @@ from random import choice, uniform
 from asyncio import sleep
 from typing import Optional
 from discord.ext import commands
-from selenium.common.exceptions import TimeoutException
+from selenium.common.exceptions import StaleElementReferenceException, TimeoutException
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
@@ -41,12 +41,22 @@ from Converters import Country, Dmg, FoodOrGift, Id, IsMyNick, MotivateType, Pro
 
 # You may want to replace all `consume_first="gift"` to `consume_first="food"`
 
+MAX_TRAVEL_DROPS = 5  # το game δίνει μέχρι τόσα drops από travel ανά 24 ώρες (το .tfarm σταματάει εκεί)
+
 
 class War(Cog):
     """War Commands"""
 
     def __init__(self, bot):
         self.bot = bot
+        # ένα browser για όλα: αν τρέχουν 2 .watch μαζί, πολεμάει μόνο το ένα κάθε φορά
+        self.fight_lock = asyncio.Lock()
+
+    def current_region(self) -> Optional[int]:
+        """Η τοποθεσία σου από το sidebar ("Location") της σελίδας που είναι ανοιχτή (γρήγορα, χωρίς page load)."""
+        links = self.bot.browser_window.find_elements(
+            By.XPATH, "//*[contains(text(), 'Location')]/following::a[contains(@href, 'region.html?id=')][1]")
+        return int(utils.get_id(links[0].get_attribute("href"))) if links else None
 
     async def fight_restore(self, link: str, side: Optional[str], weapon_quality: int) -> (int, int, str, str, str):
         """
@@ -67,8 +77,8 @@ class War(Cog):
             return side, 0, 0, "", error
         start_food, start_gift = utils.get_limits(tree)
         berserks = damage_done = no_answer = 0
+        health = utils.get_health(tree) or 0
         while True:
-            health = utils.get_health(tree) or 0
             if health < 50:
                 # το επόμενο Fight θα φάει: ξαναφόρτωσε για σωστά health / limits
                 tree = await self.bot.get_content(link, return_tree=True)
@@ -90,11 +100,11 @@ class War(Cog):
                     break
                 continue
             no_answer = 0
-            tree = fromstring(driver.page_source)
-            response = tree.xpath('//*[@id="fightResponse"]')
-            response_text = " ".join((response[0].text_content() if response else "").split())
-            damage = tree.xpath('//*[@id="fightResponse"]//*[@id="DamageDone"]')
-            if not damage:
+            result = self.read_fight_result()
+            response_text = " ".join(result["text"].split())
+            if result["health"] is not None:
+                health = result["health"]
+            if not result["damage"]:
                 if "Slow down" in response_text:
                     continue  # δεν μετράει, ξαναδοκίμασε
                 if "Round is closed" in response_text:
@@ -103,7 +113,7 @@ class War(Cog):
                     error = response_text[:300]
                 break
             berserks += 1
-            damage_done += int(re.sub(r"\D", "", damage[0].text_content().split("+")[0]) or 0)
+            damage_done += int(re.sub(r"\D", "", result["damage"].split("+")[0]) or 0)
             await sleep(uniform(0.5, 2))
 
         tree = await self.bot.get_content(link, return_tree=True)
@@ -343,14 +353,28 @@ class War(Cog):
             return
 
         # Όλα γίνονται με clicks στο travel.html (λίστες χωρών/regions της σελίδας), οπότε δουλεύει σε κάθε server
-        base_url = f"https://{ctx.channel.name}.e-sim.org/"
+        server = ctx.channel.name
+        base_url = f"https://{server}.e-sim.org/"
         driver = self.bot.browser_window
         visited = set()
         travels_done = 0
+        failed_travels = 0
 
+        # drops: το game δίνει μέχρι 5 ανά 24 ώρες -> αν έχουν ήδη βρεθεί 5, δεν έχει νόημα να ξεκινήσει
+        drops = await self.travel_drops(server, nick)
+        if len(drops) >= MAX_TRAVEL_DROPS:
+            next_drop = datetime.fromtimestamp(min(drops) + 24 * 3600).strftime("%d/%m %H:%M")
+            await ctx.send(f"**{nick}** Already {len(drops)} travel drops in the last 24h. "
+                           f"Next drop possible after {next_drop}. Not starting tfarm.")
+            return
+        await ctx.send(f"**{nick}** Starting tfarm ({len(drops)}/{MAX_TRAVEL_DROPS} drops in the last 24h). "
+                       f"Cancel with `.cancel tfarm {nick}`")
+
+        # το travel.html φορτώνεται μία φορά εδώ· μετά από κάθε travel το reload του ελέγχου τοποθεσίας
+        # (βήμα 5) είναι ήδη η φρέσκια σελίδα για το επόμενο travel
+        await self.bot.get_content(f"{base_url}travel.html")
         while travels_done < num_travels and not utils.should_break(ctx):
-            await self.bot.get_content(f"{base_url}travel.html")
-            await sleep(uniform(1, 2))
+            await sleep(uniform(0.3, 0.8))
 
             # 1. Ticket (μόνο όσα έχεις στο storage)
             tickets = {int(o.get_attribute("data-ticket-quality")): o for o in
@@ -378,7 +402,7 @@ class War(Cog):
                         WebDriverWait(driver, 10).until(EC.staleness_of(old_regions[0]))
                 except TimeoutException:
                     pass
-                await sleep(uniform(0.5, 1))
+                await sleep(uniform(0.2, 0.5))
                 regions = [o for o in driver.find_elements(By.CSS_SELECTOR, "#regionListDropDown > .option")
                            if self.is_active(o) and o.get_attribute("data-region-id") not in visited]
                 if regions:
@@ -390,52 +414,125 @@ class War(Cog):
             region_id = target.get_attribute("data-region-id")
             region_name = " ".join(target.get_attribute("textContent").split())
             await self.pick_dropdown_option("travelSelectedRegion", target)
-            await sleep(uniform(0.5, 1))
+            await sleep(uniform(0.2, 0.5))
 
-            # 4. Ticket + Travel
-            ticket_option = driver.find_element(
-                By.CSS_SELECTOR, f'#travelListDropdown > .option[data-ticket-quality="{ticket}"]')
-            await self.pick_dropdown_option("travelSelectedTicket", ticket_option)
-            await sleep(uniform(0.5, 1))
-            # η απάντηση του game μπαίνει στο #travelReload ("You have moved to ..." ή μήνυμα λάθους)
-            travel_box = driver.find_element(By.ID, "travelReload")
-            before = travel_box.get_attribute("textContent")
+            # 4. Ticket (μόνο αν δεν είναι ήδη επιλεγμένο) + Travel
+            selected_ticket = driver.find_element(By.ID, "travelSelectedTicket").get_attribute("data-ticket-quality")
+            if selected_ticket != str(ticket):
+                ticket_option = driver.find_element(
+                    By.CSS_SELECTOR, f'#travelListDropdown > .option[data-ticket-quality="{ticket}"]')
+                await self.pick_dropdown_option("travelSelectedTicket", ticket_option)
+                await sleep(uniform(0.2, 0.5))
+            # Κλείσε τα ανοιχτά dropdowns (ανοίγουν με hover): η λίστα των regions μπορεί να καλύπτει το κουμπί
+            # Travel και τότε το click διαλέγει άλλο region αντί να ταξιδέψει.
+            await self.close_travel_dropdowns()
+            if driver.find_element(By.ID, "travelSelectedRegion").get_attribute("data-region-id") != region_id:
+                await self.pick_dropdown_option("travelSelectedRegion", target)  # ξαναδιάλεξε το σωστό region
+                await self.close_travel_dropdowns()
+            old_error = driver.execute_script(
+                "const e = document.querySelector('#newError, .newError'); return e ? e.textContent.replace(/\\s+/g, ' ').trim() : '';")
             ActionChains(driver).move_to_element(driver.find_element(By.ID, "travelButton")).click().perform()
-            try:
-                WebDriverWait(driver, 20).until(
-                    lambda d: d.find_element(By.ID, "travelReload").get_attribute("textContent") != before)
-            except TimeoutException:
-                pass
-            answer = " ".join(driver.find_element(By.ID, "travelReload").get_attribute("textContent").split())
-            await sleep(uniform(1, 2))
+            # Περίμενε την ΠΡΑΓΜΑΤΙΚΗ απάντηση ("You have moved to ..." ή κόκκινο error), μέχρι 20 sec.
+            # Προσοχή: το spinner αλλάζει αμέσως το #travelReload, και αν φύγουμε από τη σελίδα νωρίς ακυρώνεται το travel.
+            answer, error = "", ""
+            for _ in range(80):  # έλεγχος κάθε 0.25 sec
+                await sleep(0.25)
+                reply = driver.execute_script("""
+                    const box = document.getElementById('travelReload').cloneNode(true);
+                    box.querySelectorAll('script, style, link, .dropdownDark').forEach(e => e.remove());
+                    const err = document.querySelector('#newError, .newError');
+                    // drop: "You have found <item> on the way here!" -> όνομα item από title/alt της εικόνας (αν υπάρχει)
+                    let item = '';
+                    const found = [...document.querySelectorAll('#travelReload *')].reverse()
+                        .find(e => /You have found/i.test(e.textContent));
+                    if (found) {
+                        const area = found.parentElement || found;
+                        item = [...area.querySelectorAll('img, [title], [data-original-title]')]
+                            .map(e => e.getAttribute('data-original-title') || e.title || e.alt || '')
+                            .filter(Boolean).join(', ').replace(/<[^>]*>/g, ' ').replace(/\\s+/g, ' ').trim();
+                    }
+                    return {text: box.textContent.replace(/\\s+/g, ' ').trim(),
+                            error: err ? err.textContent.replace(/\\s+/g, ' ').trim() : '', item: item};""")
+                answer = reply["text"]
+                error = reply["error"] if reply["error"] != old_error else ""  # μόνο καινούριο error μετράει
+                if "moved to" in answer.lower() or error:
+                    break
+            await sleep(uniform(0.3, 0.8))
 
-            # 5. Έλεγχος ότι άλλαξε η τοποθεσία (sidebar Location)
+            # 5. Έλεγχος ότι άλλαξε η τοποθεσία (sidebar Location) - το reload είναι και η σελίδα του επόμενου travel
             await self.bot.get_content(f"{base_url}travel.html")
             location = driver.find_element(
                 By.XPATH, "//*[contains(text(), 'Location')]/following::a[contains(@href, 'region.html?id=')][1]")
             if utils.get_id(location.get_attribute("href")) != region_id:
-                game_says = answer[:200] if "moved to" not in answer.lower() else "no answer from the game"
-                await ctx.send(f"**{nick}** ERROR: travel to {region_name} ({region_id}) did not happen "
-                               f"(game says: {game_says}). Stopping tfarm.")
-                break
+                game_says = error or (answer[:200] if "moved to" not in answer.lower() else "") or "no answer"
+                failed_travels += 1
+                if failed_travels >= 2:  # 2 αποτυχίες στη σειρά -> σταματάει
+                    await ctx.send(f"**{nick}** ERROR: travel to {region_name} ({region_id}) did not happen "
+                                   f"(game says: {game_says}). Stopping tfarm.")
+                    break
+                await ctx.send(f"**{nick}** WARNING: travel to {region_name} ({region_id}) did not happen "
+                               f"(game says: {game_says}). Trying another region...")
+                await sleep(uniform(5, 10))
+                continue
+            failed_travels = 0
 
             visited.add(region_id)
             travels_done += 1
             ate = f" (ate: {', '.join(ate)})" if ate else ""
+            found = ""
+            if "you have found" in answer.lower():  # drop!
+                drops = await self.travel_drops(server, nick, add=True)
+                found = f"\n🎁 DROP: {reply.get('item') or 'item'} ({len(drops)}/{MAX_TRAVEL_DROPS} in the last 24h)"
             await ctx.send(f"**{nick}** Travel {travels_done}/{num_travels} -> {region_name} "
-                           f"(Q{ticket}){ate} <{base_url}region.html?id={region_id}>")
-            await sleep(uniform(0.5, 1.5))
+                           f"(Q{ticket}){ate} <{base_url}region.html?id={region_id}>{found}")
+            if found and len(drops) >= MAX_TRAVEL_DROPS:
+                await ctx.send(f"**{nick}** Reached {MAX_TRAVEL_DROPS} drops in the last 24h. Stopping tfarm.")
+                break
+            await sleep(uniform(0.8, 1.5))  # παύση πριν το επόμενο travel (πιο ανθρώπινο)
+
+    async def travel_drops(self, server: str, nick: str, add: bool = False) -> list:
+        """
+        Οι χρόνοι (timestamps) των drops από travel τις τελευταίες 24 ώρες, αποθηκευμένοι στο info του λογαριασμού
+        (<server>_info.json ή MongoDB). add=True: πρόσθεσε ένα drop τώρα.
+        """
+        data = await utils.find_one(server, "info", nick)
+        now = time.time()
+        drops = [t for t in data.get("travel_drops", []) if now - t < 24 * 3600]
+        if add:
+            drops.append(now)
+        if add or drops != data.get("travel_drops", []):
+            data["travel_drops"] = drops
+            await utils.replace_one(server, "info", nick, data)
+        return drops
 
     @staticmethod
     def is_active(option) -> bool:
         classes = option.get_attribute("class") or ""
         return "disabled" not in classes and "notActive" not in classes
 
+    async def close_travel_dropdowns(self):
+        """
+        Πάει το ποντίκι έξω από τις λίστες του travel.html (στο sidebar) ώστε να κλείσουν, και περιμένει
+        μέχρι το κουμπί Travel να μην καλύπτεται από καμία λίστα.
+        """
+        driver = self.bot.browser_window
+        ActionChains(driver).move_to_element(driver.find_element(By.ID, "actualHealth")).perform()
+        for _ in range(10):
+            await sleep(uniform(0.15, 0.3))
+            uncovered = driver.execute_script("""
+                const b = document.getElementById('travelButton');
+                b.scrollIntoView({block: 'nearest'});
+                const r = b.getBoundingClientRect();
+                const el = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2);
+                return !!el && (el === b || b.contains(el));""")
+            if uncovered:
+                return
+
     async def pick_dropdown_option(self, selected_id: str, option):
         """Ανοίγει το dropdown του travel.html (hover) και κάνει click στην επιλογή."""
         driver = self.bot.browser_window
         ActionChains(driver).move_to_element(driver.find_element(By.ID, selected_id)).perform()
-        await sleep(uniform(0.5, 1))
+        await sleep(uniform(0.3, 0.6))
         # οι λίστες έχουν scroll, οπότε scrollIntoView + click μέσω JS (τρέχει το onclick της σελίδας)
         driver.execute_script("arguments[0].scrollIntoView({block: 'nearest'}); arguments[0].click();", option)
 
@@ -593,6 +690,73 @@ class War(Cog):
             print(f"[WARNING] Berserk checkbox not found for {side}")
 
 
+    async def use_medkit_on_battle_page(self) -> (bool, str):
+        """
+        Χρησιμοποιεί medkit από το μενού special items του battle page (εικονίδιο σύριγγας), χωρίς να φύγει από τη μάχη.
+        ΑΣΦΑΛΕΙΑ: στο ίδιο μενού είναι ΟΛΑ τα special items (steroids, tank, elixirs...). Το "Use" χρησιμοποιεί ό,τι
+        είναι επιλεγμένο στο #ssiType, οπότε πατάμε Use ΜΟΝΟ αν το #ssiType == "MEDKIT".
+        Επιστρέφει (ok, μήνυμα).
+        """
+        driver = self.bot.browser_window
+        medkit = driver.find_elements(By.ID, "SPECIAL_ITEM_MEDKIT")
+        if not medkit:
+            return False, "no medkit in the special items menu"
+        # (το data-can-use ΔΕΝ το ελέγχουμε: γράφεται όταν φορτώνει η σελίδα και μένει παλιό κατά τη μάχη)
+        if medkit[0].get_attribute("data-quantity") in ("0", ""):
+            return False, "no medkits left"
+
+        # άνοιξε το μενού (hover στη σύριγγα) και διάλεξε το medkit
+        syringe = driver.find_elements(By.CSS_SELECTOR, ".icon-syringe")
+        if syringe:
+            ActionChains(driver).move_to_element(syringe[0]).perform()
+            await sleep(uniform(0.4, 0.8))
+        driver.execute_script("arguments[0].click();", medkit[0])  # selectSpecialItem(this)
+        await sleep(uniform(0.3, 0.6))
+
+        selected = driver.execute_script("const t = document.getElementById('ssiType'); return t ? t.value : '';")
+        if selected != "MEDKIT":  # ποτέ Use αν είναι επιλεγμένο κάτι άλλο
+            return False, f"selected item is '{selected}', not MEDKIT - not using it"
+
+        use_button = driver.find_element(By.ID, "ssiUse")
+        # σβήσε τυχόν παλιό αποτέλεσμα, ώστε να διαβάσουμε μόνο το καινούριο
+        driver.execute_script("const s = document.getElementById('usageStatus'); if (s) s.remove();")
+        driver.execute_script("arguments[0].click();", use_button)  # useSpecialItemAjax()
+        # το μενού αντικαθίσταται με το αποτέλεσμα (#usageStatus = "Success", #specialItemType = "Medkit")
+        for _ in range(40):
+            await sleep(0.25)
+            status = driver.execute_script("""
+                const s = document.getElementById('usageStatus'), t = document.getElementById('specialItemType');
+                return s ? [s.textContent.trim(), t ? t.textContent.trim() : ''] : null;""")
+            if status:
+                ok = status[0] == "Success" and status[1].lower() == "medkit"
+                await sleep(uniform(1, 1.5))  # το game ανανεώνει health / limits (refreshLimits)
+                return ok, status[0]
+        return False, "no answer from the game"
+
+    def read_limits(self) -> (int, int):
+        """Food / gift limits από τη σελίδα που είναι ανοιχτή (γρήγορα, χωρίς να διαβάσει όλη τη σελίδα)."""
+        limits = self.bot.browser_window.execute_script("""
+            const n = s => { const e = document.querySelector(s); return e ? parseInt(e.textContent) || 0 : 0; };
+            return [n('.foodLimit'), n('.giftLimit')];""")
+        return limits[0], limits[1]
+
+    def read_fight_result(self) -> dict:
+        """
+        Διαβάζει ΜΟΝΟ το αποτέλεσμα του χτυπήματος (#fightResponse) και το health, όχι όλη τη σελίδα (πιο γρήγορο).
+        damage: το κείμενο του #DamageDone (None = το χτύπημα δεν πέρασε, δες το text), health: float ή None.
+        """
+        result = self.bot.browser_window.execute_script("""
+            const box = document.getElementById('fightResponse');
+            const dmg = box && box.querySelector('#DamageDone');
+            const hp = document.getElementById('actualHealth');
+            return {text: box ? box.textContent : '', damage: dmg ? dmg.textContent : null,
+                    health: hp ? hp.textContent : null};""")
+        try:
+            health = float(result["health"]) if result["health"] else None
+        except ValueError:
+            health = None
+        return {"text": result["text"] or "", "damage": result["damage"], "health": health}
+
     def click_fight(self, side) -> bool:
         """
         Click στο κουμπί Fight. Αν υπάρχει popup, το click το κλείνει και ξαναδοκιμάζει.
@@ -680,102 +844,88 @@ class War(Cog):
                 weapon_quality and wep < (food_limit + gift_limit) * 5 / 0.6):
             output += f"\nWARNING: you need to refill your storage. See `.help supply`, `.help pack`, `.help buy`"
         msg = await ctx.send(output)
-        damage_done = 0
-        update = 0
-        no_answer = 0
+        damage_done = 0  # hits: 5 ανά click (Berserk), dmg: εκτίμηση από το τελευταίο χτύπημα
+        clicks = 0
+        stuck_checks = 0  # έλεγχοι στη σειρά χωρίς χτύπημα (για να μην πατάει για πάντα)
+        CHECK_EVERY = 10  # γρήγορος έλεγχος (limits / μηνύματα) κάθε τόσα clicks
         if ctx.invoked_with.lower() != "fight_fast":
             await sleep(uniform(3, 7))
         hits_or_dmg = "hits" if dmg <= 1000 else "dmg"
+        side_str = "Left" if side == "defender" else "Right"
+        fight_button = driver.find_element(By.ID, f"fightButton{side_str}Side")
+
+        # Πατάει Fight συνέχεια, ΧΩΡΙΣ να περιμένει την απάντηση (όπως με το χέρι). Το game τρώει food/gift μόνο του,
+        # τα "Slow down" αγνοούνται. Κάθε ~10 clicks ένας γρήγορος έλεγχος: limits (για medkit) και μηνύματα.
         while damage_done < dmg and not utils.should_break(ctx):
-            if len(output) > 1900:
-                output = "(Message is too long)"
-            if weapon_quality > 0 and ((dmg >= 5 > wep) or (dmg < 5 and wep == 0)):
-                await ctx.send(
-                    f"**{nick}** Done {damage_done:,} {hits_or_dmg}\nERROR: no Q{weapon_quality} weps in storage")
-                break
-            health = utils.get_health(tree)
-            if (health < 50 and dmg >= 5) or (health == 0 and dmg < 5):
-                food_limit, gift_limit = utils.get_limits(tree)
-                if food_limit == 0 and gift_limit == 0:
-                    if medkits > 0:
-                        try:
-        # Ανοίγουμε την σελίδα του medkit
-                            medkit_url = f"https://{server}.e-sim.org/storage.html?storageType=SPECIAL_ITEM"
-                            await self.bot.get_content(medkit_url)
-
-        # Πατάμε το κουμπί με id 'useMedkitMission'
-                            medkit_button = driver.find_element(By.ID, "useMedkitMission")
-                            driver.execute_script("arguments[0].click();", medkit_button)
-
-                            medkits -= 1
-                            await ctx.send(f"**{nick}** used a Medkit! Remaining: {medkits}")
-
-                            await sleep(1.5)  # λίγο χρόνο για να ενημερωθεί η ζωή
-
-        # Επιστρέφουμε στη μάχη
-                            driver.get(link)
-                            tree = fromstring(driver.page_source)
-                            self.setup_fight(weapon_quality, side, consume_first)
-                            continue  # συνεχίζουμε το fight loop
-
-                        except NoSuchElementException:
-                            await ctx.send(f"**{nick}** ERROR: couldn't find Medkit button")
-                            break
-
-                    else:
-                        break
-                # αλλιώς: το game τρώει food/gift μόνο του όταν πατάμε Fight
             try:
-                berserk_checkbox = driver.find_element(By.ID, f"{side}BerserkCheckbox")  # attackerBerserkCheckbox / defenderBerserkCheckbox
-                if not berserk_checkbox.is_selected():  # αν δεν είναι ήδη επιλεγμένο
-                    driver.execute_script("arguments[0].click();", berserk_checkbox)
-                    print(f"[DEBUG] Χ5 selected for side {side}")
-            except NoSuchElementException:
-                print(f"[DEBUG] Berserk checkbox for side {side} not found")
-            if not self.click_fight(side):
-                no_answer += 1
-                if no_answer >= 3:
-                    await ctx.send(f"**{nick}** ERROR: the fight button doesn't respond. Stopping.")
-                    break
+                fight_button.click()
+            except StaleElementReferenceException:
+                fight_button = driver.find_element(By.ID, f"fightButton{side_str}Side")
                 continue
-            no_answer = 0
-            tree = fromstring(self.bot.browser_window.page_source)
-            # Η απάντηση του χτυπήματος είναι στο #fightResponse: αν έχει DamageDone -> πέτυχε
-            response = tree.xpath('//*[@id="fightResponse"]')
-            response_text = response[0].text_content() if response else ""
-            damage = tree.xpath('//*[@id="fightResponse"]//*[@id="DamageDone"]')
-            if not damage:
-                if "Slow down" in response_text:
-                    continue  # δεν μετράει ως χτύπημα, ξαναδοκίμασε
-                elif "Round is closed" in response_text:
+            except Exception:  # π.χ. popup από πάνω: ένα click με το ποντίκι το κλείνει
+                try:
+                    ActionChains(driver).move_to_element(fight_button).click().perform()
+                except Exception:
+                    pass
+            clicks += 1
+            if dmg <= 1000:
+                damage_done += 5  # μέτρημα με τα clicks (όχι ακριβές, όπως ζητήθηκε)
+
+            if clicks % CHECK_EVERY == 0:
+                state = driver.execute_script("""
+                    const n = s => { const e = document.querySelector(s); return e ? parseFloat(e.textContent) || 0 : 0; };
+                    const box = document.getElementById('fightResponse');
+                    const dmg = box && box.querySelector('#DamageDone');
+                    return {food: n('.foodLimit'), gift: n('.giftLimit'), health: n('#actualHealth'),
+                            text: box ? box.textContent.replace(/\\s+/g, ' ').trim().slice(0, 300) : '',
+                            damage: dmg ? dmg.textContent : null};""")
+                if dmg > 1000 and state["damage"]:  # εκτίμηση: τελευταίο χτύπημα x clicks από τον προηγούμενο έλεγχο
+                    damage_done += int(re.sub(r"\D", "", state["damage"].split("+")[0]) or 0) * CHECK_EVERY
+                if "Round is closed" in state["text"]:
                     output += "\nRound is over."
                     if continue_next_round:
                         await sleep(uniform(15, 25))
+                        fight_button = driver.find_element(By.ID, f"fightButton{side_str}Side")
                         continue
-                    else:
+                    break
+                if state["damage"] or "Slow down" in state["text"]:
+                    stuck_checks = 0
+                elif state["food"] or state["gift"] or state["health"] >= 50:
+                    stuck_checks += 1
+                    if stuck_checks >= 3:  # 3 έλεγχοι στη σειρά με άλλο μήνυμα -> σταματάει
+                        await ctx.send(f"**{nick}** ERROR: {state['text'] or 'no hits are going through'}"[:1900])
                         break
-                elif "No health left" in response_text:
-                    output += "\nNo health left."
-                    break
-                else:
-                    await ctx.send(f"**{nick}** ERROR: {' '.join(response_text.split())}"[:1900])
-                    break
-            if weapon_quality:
-                wep -= 5
-            if dmg <= 1000:
-                damage_done += 5
-            else:
-                damage_done += int(re.sub(r"\D", "", damage[0].text_content().split("+")[0]) or 0)
-            update += 1
+                # limits 0 και δεν φτάνει το health για Berserk -> medkit
+                if state["food"] == 0 and state["gift"] == 0 and state["health"] < 50:
+                    if medkits <= 0:
+                        output += "\nNo limits / medkits left."
+                        break
+                    # medkit από το μενού της σύριγγας στο ίδιο το battle page (χωρίς αλλαγή σελίδας)
+                    ok, message = await self.use_medkit_on_battle_page()
+                    if not ok:  # ίσως παλιά δεδομένα στη σελίδα: reload και μία ακόμα προσπάθεια
+                        await self.bot.get_content(link)
+                        await sleep(uniform(1, 2))
+                        ok, message = await self.use_medkit_on_battle_page()
+                        self.setup_fight(weapon_quality, side, consume_first)
+                        fight_button = driver.find_element(By.ID, f"fightButton{side_str}Side")
+                    if not ok:
+                        await ctx.send(f"**{nick}** ERROR: couldn't use a medkit ({message})")
+                        break
+                    medkits -= 1
+                    stuck_checks = 0
+                    await ctx.send(f"**{nick}** used a Medkit! Remaining: {medkits}")
+                if clicks % (CHECK_EVERY * 4) == 0:
+                    if len(output) > 1900:
+                        output = "(Message is too long)"
+                    output += f"\n{hits_or_dmg.title()} done so far: ~{damage_done:,}"
+                    await msg.edit(content=output)
+
+            # οι δικές σου τυχαίες παύσεις ανάμεσα στα clicks
             if t2 or uniform(1, 100) < 20:  # 20% chance to sleep less if not t2
                 await sleep(uniform(0.05, 0.12))
             else:
                 await sleep(uniform(0.05, 0.12))
-
-            if update % 4 == 0:
-                # dmg update every 4 berserks.
-                output += f"\n{hits_or_dmg.title()} done so far: {damage_done:,}"
-                await msg.edit(content=output)
+        food_limit, gift_limit = self.read_limits()
         await msg.edit(content=output)
         await ctx.send(f"**{nick}** Done {damage_done:,} {hits_or_dmg}, remaining limits: {food_limit}/{gift_limit}")
         await utils.update_info(server, nick, {"limits": f"{food_limit}/{gift_limit}"})
@@ -1366,10 +1516,30 @@ class War(Cog):
 
     @command()
     async def medkit(self, ctx, *, nick: IsMyNick):
-        """Using a medkit"""
+        """Using a medkit (κουμπί "Use medkit" στο sidebar + επιβεβαίωση στο popup)"""
         server = ctx.channel.name
+        driver = self.bot.browser_window
         await self.bot.get_content(f"https://{server}.e-sim.org/index.html")
-        url = await self.bot.get_content(f"https://{server}.e-sim.org/medkit.html", data={})
+        await sleep(uniform(1, 2))
+        buttons = [b for b in driver.find_elements(By.ID, "medkitButton") if b.is_displayed()]
+        if not buttons:
+            return await ctx.send(f"**{nick}** ERROR: no 'Use medkit' button (0 medkits?)")
+        ActionChains(driver).move_to_element(buttons[0]).pause(uniform(0.3, 0.8)).click().perform()
+
+        # popup επιβεβαίωσης: πάτα το κουμπί επιβεβαίωσης ΜΟΝΟ αν είναι το popup του medkit
+        confirm = None
+        for _ in range(20):
+            await sleep(0.25)
+            modals = [m for m in driver.find_elements(By.CSS_SELECTOR, ".defaultModal") if m.is_displayed()]
+            if modals and "medkit" in modals[-1].get_attribute("textContent").lower():
+                confirm = modals[-1].find_elements(By.CSS_SELECTOR, ".modalFooter button.btn-buy")
+                break
+        if not confirm:
+            return await ctx.send(f"**{nick}** ERROR: the medkit confirmation didn't show up")
+        await sleep(uniform(0.5, 1.2))
+        ActionChains(driver).move_to_element(confirm[0]).pause(uniform(0.2, 0.5)).click().perform()
+        await sleep(uniform(2, 3))  # το form στέλνεται και η σελίδα ανανεώνεται
+        url = driver.current_url
         await ctx.send(f"**{nick}** MEDKIT: <{url}>")
         if url.endswith("MESSAGE_OK"):  # update db
             data = await utils.find_one(server, "info", nick)
@@ -1524,6 +1694,10 @@ class War(Cog):
             await ctx.send(f"**{nick}** T{round(start_time / 60, 1)} at <{battle_link}&round={r['currentRound']}>")
             tree = await self.bot.get_content(battle_link, return_tree=True)
             hidden_id = tree.xpath("//*[@id='battleRoundId']")[0].value
+            # bonus region: υπολογίζεται μία φορά ανά γύρο (όχι σε κάθε "συμπλήρωμα" του wall)
+            bonus_region = 0
+            if 1 <= ticket_quality <= 5:
+                bonus_region = await utils.get_bonus_region(self.bot, base_url, side, r)
 
             while not error:
                 # το live score της μάχης (το ίδιο που φορτώνει η σελίδα), στο δεύτερο παράθυρο
@@ -1537,9 +1711,16 @@ class War(Cog):
                 enemy_side = int(battle_score[enemy + "Score"].replace(",", ""))
                 wall = keep_wall * (battle_score[f"{enemy}sOnline"] + 1) if battle_score["spectatorsOnline"] != 1 else 1
                 if enemy_side - my_side < let_overkill and my_side - enemy_side < wall:
-                    error, medkits = await ctx.invoke(self.bot.get_command("fight"), nick, battle, side, weapon_quality,
-                                                      max(enemy_side - my_side + wall, 10001), ticket_quality,
-                                                      consume_first, medkits)
+                    async with self.fight_lock:  # αν τρέχει κι άλλο .watch, περίμενε να τελειώσει το δικό του fight
+                        # πέτα μόνο αν ΔΕΝ είσαι ήδη στο bonus region (π.χ. ένα άλλο .watch σε πήγε αλλού)
+                        if bonus_region and self.current_region() != bonus_region:
+                            if not await ctx.invoke(self.bot.get_command("fly"), bonus_region, ticket_quality,
+                                                    nick=nick):
+                                break
+                        # ticket_quality=0 -> το .fight δεν ξαναψάχνει bonus region / δεν ξαναπετάει
+                        error, medkits = await ctx.invoke(self.bot.get_command("fight"), nick, battle, side,
+                                                          weapon_quality, max(enemy_side - my_side + wall, 10001),
+                                                          0, consume_first, medkits)
                     ctx.invoked_with = "fight_fast"
                 await sleep(uniform(6, 13))
 

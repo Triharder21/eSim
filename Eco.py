@@ -44,8 +44,11 @@ import utils
 from Converters import Country, Id, IsMyNick, Product, Quality
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import Select
+from selenium.webdriver.support.ui import Select, WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException
 from random import shuffle
+import re
 
 
 class Eco(Cog):
@@ -186,134 +189,95 @@ class Eco(Cog):
             f"`.cancel bid_all_auctions {nick}`"
         )
 
+        # Friends: in-game friends + custom friends + own nick
+        all_friends = set([nick.lower()] + [f.lower() for f in self.bot.friends.get(server, [])] + custom_friends)
+        # Τα ονόματα των items στη σελίδα -> ονόματα στο auctions_prices_<server>.json
+        eq_aliases = {"weapon_upgrade": "weapon", "personal_armor": "armor", "lucky_charm": "charm"}
+        normalized_keys = {k.lower().replace("_", ""): k for k in prices}
+
+        def price_key(auction_item: str) -> str:
+            parts = auction_item.split()
+            if not parts:
+                return ""
+            if len(parts) > 1 and re.fullmatch(r"Q\d", parts[0]):  # "Q7 WEAPON_UPGRADE ..." -> weapon7
+                item_type = parts[1].lower()
+                return eq_aliases.get(item_type, item_type) + parts[0][1:]
+            code = parts[0].lower().replace("extra_", "")  # "EXTRA_VACATIONS" -> vacations
+            return normalized_keys.get(code.replace("_", ""), code)
+
+        def pick_price(key: str) -> float:
+            price = choice((str(prices.get(key, "0")) or "0").split(",")).strip()
+            if "-" in price:
+                low, high = price.split("-")
+                return round(uniform(float(low), float(high)), 2)
+            return float(price or 0)
+
+        driver = self.bot.browser_window
+        await self.bot.get_content(f"{base_url}auctions.html")
+        await sleep(uniform(2, 4))
         page = 1
 
         while not utils.should_break(ctx):
-
-            url = (
-                f"{base_url}auctionsOffers?"
-                f"status=IN_PROGRESS&"
-                f"type=null&"
-                f"equipmentSorting=TIME&"
-                f"page={page}&"
-                f"selectedAuctionType_ANY=true&"
-                f"selectedAuctionStatus_IN_PROGRESS=true&"
-                f"selectedAuctionEquipmentSorting_TIME=true"
-            )
-
-            tree = await self.bot.get_content(
-                url,
-                return_tree=True
-            )
-
-            # Παίρνουμε ΜΟΝΟ τα πλήρη BID buttons.
-            # Όλα τα στοιχεία του auction βρίσκονται πλέον
-            # στα data-* attributes του ίδιου button.
-            buttons = tree.xpath(
-                "//button[@data-action='BID' "
-                "and @data-id "
-                "and @data-minimal-outbid]"
-            )
-
-            if not buttons:
+            # τα στοιχεία κάθε auction είναι στο κίτρινο κουμπί (data-*), το bid γίνεται με το πράσινο
+            offers = [{"id": b.get_attribute("data-id"),
+                       "min_bid": float(b.get_attribute("data-minimal-outbid") or 0),
+                       "buyer": (b.get_attribute("data-top-bidder") or "").strip().lower(),
+                       "item": b.get_attribute("data-auction-item") or ""}
+                      for b in driver.find_elements(By.CSS_SELECTOR, "button.btn-yellow[data-action='BID']")]
+            if not offers:
                 break
 
             results = []
-
-            for button in buttons:
-
+            for offer in offers:
                 if utils.should_break(ctx):
                     break
-
-                auction_id = button.attrib["data-id"]
-                min_bid = button.attrib["data-minimal-outbid"]
-                buyer = button.attrib.get(
-                    "data-top-bidder", ""
-                ).strip().lower()
-
-                auction_item = button.attrib.get(
-                    "data-auction-item", ""
-                )
-
-                # Example:
-                # "Q1 VISION null ..."
-                item_parts = auction_item.split()
-
-                if len(item_parts) < 2:
+                key = price_key(offer["item"])
+                price = pick_price(key)
+                # Don't bid if: our price is below the minimum outbid, or the top bidder is a friend / ourselves
+                if not price or offer["min_bid"] > price or offer["buyer"] in all_friends:
                     continue
 
-                quality = item_parts[0].lower()
-                item_type = item_parts[1].lower()
+                # γράψε την τιμή στο κουτάκι της γραμμής και πάτα το πράσινο κουμπί (όπως με το χέρι)
+                price_box = driver.find_element(By.ID, f"bidPrice{offer['id']}")
+                ActionChains(driver).move_to_element(price_box).pause(uniform(0.3, 0.8)).click().perform()
+                price_box.clear()
+                for char in f"{price:.2f}":
+                    price_box.send_keys(char)
+                    await sleep(uniform(0.05, 0.2))
+                await sleep(uniform(0.5, 1.5))
+                bid_button = driver.find_element(
+                    By.CSS_SELECTOR, f"button.bid[data-action='BID'][data-id='{offer['id']}']")
+                self.human_click(bid_button)
 
-                # Q1 -> 1, Q2 -> 2, etc.
-                if not quality.startswith("q"):
-                    continue
-
-                q = quality[1:]
-
-                # Convert auction item name to the same names
-                # used in auctions_prices_<server>.json
-                item = f"{item_type}{q}"
-
-                # Friends: in-game friends + custom friends + own nick
-                all_friends = set(
-                    [nick.lower()]
-                    + [
-                        friend.lower()
-                        for friend in self.bot.friends.get(server, [])
-                    ]
-                    + custom_friends
-                )
-
-                # Price configured for this item
-                price = str(prices.get(item, "0")) or "0"
-                price = choice(price.split(","))
-
-                if "-" in price:
-                    min_price, max_price = price.split("-")
-                    price = round(
-                        uniform(
-                            float(min_price),
-                            float(max_price)
-                        ),
-                        2
-                    )
-
-                # Don't bid if:
-                # - minimum outbid is higher than our configured price
-                # - current bidder is a friend
-                # - current bidder is ourselves
-                if (
-                    float(min_bid) > float(price)
-                    or buyer in all_friends
-                ):
-                    continue
-
-                payload = {
-                    "action": "BID",
-                    "id": auction_id,
-                    "price": price
-                }
-
-                await self.bot.get_content(
-                    f"{base_url}auctionAction.html",
-                    data=payload
-                )
-
-                results.append(
-                    f"{base_url}auction.html?id={auction_id}, "
-                    f"type: {item}, price: {price}"
-                )
-
-                # blocking sleep εδώ (σκόπιμα)
-                time_module.sleep(randint(2, 7))
+                # η σελίδα αντικαθιστά τη γραμμή με το αποτέλεσμα
+                try:
+                    WebDriverWait(driver, 10).until(EC.staleness_of(bid_button))
+                    new_offer = driver.find_elements(
+                        By.CSS_SELECTOR, f"button.btn-yellow[data-action='BID'][data-id='{offer['id']}']")
+                    top = (new_offer[0].get_attribute("data-top-bidder") or "").strip() if new_offer else ""
+                    status = "✅" if top.lower() == nick.lower() else f"❌ top bidder: {top or '?'}"
+                except TimeoutException:
+                    status = "⚠️ no answer"
+                results.append(f"{status} <{base_url}auction.html?id={offer['id']}> {key}: {price:.2f}")
+                await sleep(uniform(2, 7))
 
             if results:
-                await ctx.send(
-                    f"**{nick}**\n" + "\n".join(results)
-                )
+                await ctx.send(f"**{nick}**\n" + "\n".join(results))
 
+            # επόμενη σελίδα: click στον αριθμό της (ajax paging)
+            next_page = [a for a in driver.find_elements(By.CSS_SELECTOR, "a.sendAjaxPaging")
+                         if a.text.strip() == str(page + 1)]
+            if not next_page:
+                break
+            first_offer = driver.find_elements(By.CSS_SELECTOR, "button.btn-yellow[data-action='BID']")
+            self.human_click(next_page[0])
+            try:
+                if first_offer:
+                    WebDriverWait(driver, 10).until(EC.staleness_of(first_offer[0]))
+            except TimeoutException:
+                break
             page += 1
+            await sleep(uniform(2, 4))
 
         if not utils.should_break(ctx):
             await ctx.send(
