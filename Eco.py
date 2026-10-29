@@ -50,6 +50,9 @@ from selenium.common.exceptions import TimeoutException
 from random import shuffle
 import re
 
+# .job_outbid / .auto_job_outbid: πόσες θέσεις έχει κάθε νέο skill-1 job offer που δημιουργεί
+JOB_OFFERS_TO_CREATE = 35
+
 
 class Eco(Cog):
     """Eco Commands"""
@@ -806,6 +809,339 @@ class Eco(Cog):
         await sleep(uniform(20, 60))  # ανθρώπινη παύση ανάμεσα στις δουλειές
         await ctx.invoke(self.bot.get_command("motivate"), motivate_item, nick=nick)
         await ctx.send(f"**{nick}** Daily routine done.")
+
+    # ------------------------------------------------------------------------------------------------------------
+    # Job market: κοινά κομμάτια για .job_mu_outbid (εταιρείες του MU) και .job_outbid (προσωπικές εταιρείες)
+    # ------------------------------------------------------------------------------------------------------------
+    @staticmethod
+    def _normalize_country(name: str) -> str:
+        return re.sub(r"[^a-z]", "", name.lower())
+
+    async def _my_ids(self, base_url: str) -> (Optional[str], str):
+        """(id του MU σου ή None, το citizen id σου)."""
+        driver = self.bot.browser_window
+        await self.bot.get_content(base_url + "myMilitaryUnit.html")
+        await sleep(uniform(0.3, 0.8))
+        mu_links = driver.find_elements(By.CSS_SELECTOR, "a[href*='militaryUnit.html?id=']")
+        mu_id = re.findall(r"id=(\d+)", mu_links[0].get_attribute("href"))[0] if mu_links else None
+        my_id = (re.findall(r"citizenId: '(\d+)'", driver.page_source) or [""])[0]
+        return mu_id, my_id
+
+    @staticmethod
+    def _is_mine(href: str, mu_id: Optional[str], my_id: str) -> bool:
+        """Offer δικό σου: εργοδότης το MU σου ή εσύ. Αυτά δεν μετράνε ως ανταγωνισμός (αλλιώς ανεβαίνουν
+        το ένα πάνω από το άλλο επ' άπειρον μεταξύ .job_mu_outbid και .job_outbid)."""
+        href = href or ""
+        return bool((mu_id and re.search(rf"militaryUnit\.html\?id={mu_id}$", href))
+                    or (my_id and re.search(rf"profile\.html\?id={my_id}$", href)))
+
+    async def _country_ids(self, base_url: str) -> dict:
+        """Όνομα χώρας (normalized) -> countryId, από το dropdown του job market."""
+        driver = self.bot.browser_window
+        await self.bot.get_content(base_url + "jobMarket.html")
+        await sleep(uniform(0.3, 0.8))
+        # textContent (όχι .text): το dropdown είναι κρυφό μέχρι το "Change country" και το .text βγαίνει κενό
+        return {self._normalize_country(o.get_attribute("textContent")): o.get_attribute("value")
+                for o in Select(driver.find_element(By.ID, "countryId")).options}
+
+    async def _job_tops(self, ctx, base_url: str, country_ids: set, mu_id, my_id) -> dict:
+        """
+        Job market κάθε χώρας (μία φορά): το top skill-1 offer των ΑΛΛΩΝ ανά νόμισμα.
+        Τα offers είναι ταξινομημένα ψηλότερος πρώτος -> το πρώτο ανά νόμισμα είναι το top.
+        Επιστρέφει countryId -> {νόμισμα: top salary}.
+        """
+        driver = self.bot.browser_window
+        tops = {}
+        for country_id in sorted(country_ids):
+            if utils.should_break(ctx):
+                break
+            await self.bot.get_content(f"{base_url}jobMarket.html?countryId={country_id}&minimalSkill=1&regionId=0")
+            await sleep(uniform(0.3, 0.8))
+            tops[country_id] = {}
+            for card in driver.find_elements(By.CSS_SELECTOR, "form.job-offer-form"):
+                text = " ".join(card.get_attribute("textContent").split())
+                salary = re.search(r"Salary: ([\d.]+) (\w+)", text)
+                skill = re.search(r"Min\. Economic Skill: (\d+)", text)
+                employers = [a.get_attribute("href") for a in card.find_elements(
+                    By.CSS_SELECTOR, "a[href*='profile.html'], a[href*='militaryUnit.html'], a[href*='stockCompany.html']")]
+                if salary and skill and skill.group(1) == "1" \
+                        and not any(self._is_mine(h, mu_id, my_id) for h in employers):
+                    tops[country_id].setdefault(salary.group(2), float(salary.group(1)))
+        return tops
+
+    def _skill1_offers_on_company_page(self) -> list:
+        """Τα skill-1 job offers της εταιρείας που είναι ανοιχτή: [{offer, salary, currency}]."""
+        offers = []
+        for card in self.bot.browser_window.find_elements(By.CSS_SELECTOR, "form.job-offer-form"):
+            text = " ".join(card.get_attribute("textContent").split())
+            salary = re.search(r"Salary: ([\d.]+) (\w+)", text)
+            skill = re.search(r"Min\. Economic Skill: (\d+)", text)
+            if salary and skill and skill.group(1) == "1":
+                offers.append({"offer": card.find_element(By.CSS_SELECTOR, "input[name='id']").get_attribute("value"),
+                               "salary": float(salary.group(1)), "currency": salary.group(2)})
+        return offers
+
+    def _company_currency(self) -> Optional[str]:
+        """Το νόμισμα της εταιρείας που είναι ανοιχτή, από τη φόρμα "Create job offer" ("Salary in NOK")."""
+        forms = self.bot.browser_window.find_elements(By.CSS_SELECTOR, "form.create-job-form")
+        found = re.search(r"Salary in (\w+)", " ".join(forms[0].get_attribute("textContent").split())) if forms else None
+        return found.group(1) if found else None
+
+    async def _wait_reload(self, element):
+        """Περιμένει να ξαναφορτώσει η σελίδα μετά από submit."""
+        driver = self.bot.browser_window
+        try:
+            WebDriverWait(driver, 15).until(EC.staleness_of(element))
+            WebDriverWait(driver, 15).until(lambda d: d.execute_script("return document.readyState") == "complete")
+        except TimeoutException:
+            pass
+
+    async def _fill_and_submit(self, form, values: dict):
+        """Γράφει τις τιμές στα πεδία της φόρμας και πατάει το κουμπί της (με το ποντίκι αν φαίνονται)."""
+        driver = self.bot.browser_window
+        fields = {name: form.find_element(By.NAME, name) for name in values}
+        submit = form.find_element(By.CSS_SELECTOR, "input[type='submit'], button")
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", next(iter(fields.values())))
+        if all(f.is_displayed() for f in fields.values()):
+            for name, field in fields.items():
+                ActionChains(driver).move_to_element(field).pause(uniform(0.1, 0.3)).click().perform()
+                field.clear()
+                field.send_keys(values[name])  # όλο το νούμερο μαζί
+            await sleep(uniform(0.2, 0.5))
+            ActionChains(driver).move_to_element(submit).pause(uniform(0.1, 0.3)).click().perform()
+        else:  # κρυμμένη φόρμα: γέμισε τα πεδία και πάτα το κουμπί μέσω της σελίδας
+            driver.execute_script("""
+                const [form, values, submit] = arguments;
+                for (const name in values) form.querySelector(`[name="${name}"]`).value = values[name];
+                submit.click();""", form, values, submit)
+        await self._wait_reload(form)
+
+    async def _edit_offer(self, offer_id: str, target: float) -> Optional[str]:
+        """Αλλάζει τον μισθό του offer στη σελίδα της εταιρείας που είναι ανοιχτή. None = ok, αλλιώς το λάθος."""
+        forms = self.bot.browser_window.find_elements(
+            By.XPATH, f"//form[.//input[@name='action' and @value='EDIT_JOB_OFFER']]"
+                      f"[.//input[@name='offerId' and @value='{offer_id}']]")
+        if not forms:
+            return f"offer {offer_id} not found"
+        await self._fill_and_submit(forms[0], {"salary": f"{target:.2f}"})
+        return self.page_error() or None
+
+    async def _create_offer(self, target: float) -> Optional[str]:
+        """Νέο job offer (skill 1, target, JOB_OFFERS_TO_CREATE θέσεις) στην εταιρεία που είναι ανοιχτή."""
+        forms = self.bot.browser_window.find_elements(By.CSS_SELECTOR, "form.create-job-form")
+        if not forms:
+            return "no 'Create job offer' form"
+        await self._fill_and_submit(forms[0], {"minimalSkill": "1", "price": f"{target:.2f}",
+                                               "quantity": str(JOB_OFFERS_TO_CREATE)})
+        return self.page_error() or None
+
+    async def _outbid_on_company_page(self, company_id: str, tops_of_country: dict, offers: list,
+                                      stats: dict) -> None:
+        """
+        Στη σελίδα μιας εταιρείας (ήδη ανοιχτή): ανεβάζει τα skill-1 offers κάτω από top + 0.25,
+        ή δημιουργεί ένα αν δεν έχει κανένα. Τα αποτελέσματα μαζεύονται στο stats.
+        """
+        if offers:
+            for o in offers:
+                top = tops_of_country.get(o["currency"])
+                if top is None:
+                    stats["no_competitor"].add(o["currency"])
+                    continue
+                target = round(top + 0.25, 2)
+                if o["salary"] >= target:
+                    stats["ok"] += 1
+                    continue
+                error = await self._edit_offer(o["offer"], target)
+                if error:
+                    stats["failed"].append(error)
+                else:
+                    stats["raised"].append(f"{company_id} ({target:.2f} {o['currency']})")
+                await sleep(uniform(0.3, 0.8))
+        else:
+            currency = self._company_currency()
+            top = tops_of_country.get(currency) if currency else None
+            if top is None:
+                stats["skipped"].append(company_id)  # κανένα άλλο skill-1 offer σε αυτό το νόμισμα -> δεν μαντεύουμε
+                return
+            target = round(top + 0.25, 2)
+            error = await self._create_offer(target)
+            if error:
+                stats["failed"].append(error)
+            else:
+                stats["created"].append(f"{company_id} ({target:.2f} {currency})")
+            await sleep(uniform(0.3, 0.8))
+
+    @staticmethod
+    def _outbid_report(stats: dict) -> list:
+        lines = []
+        if stats["raised"]:
+            lines.append(f"⬆️ raised {len(stats['raised'])} skill-1 offers: {', '.join(stats['raised'])}")
+        if stats["ok"]:
+            lines.append(f"✅ {stats['ok']} skill-1 offers were already above the top other offer + 0.25")
+        if stats["created"]:
+            lines.append(f"🆕 created skill-1 offers (x{JOB_OFFERS_TO_CREATE}) in {len(stats['created'])} companies: "
+                         f"{', '.join(stats['created'])}")
+        if stats["no_competitor"]:
+            lines.append(f"⏭️ no other skill-1 offers in: {', '.join(sorted(stats['no_competitor']))} (nothing to outbid)")
+        if stats["skipped"]:
+            lines.append(f"⏭️ no other skill-1 offers in their currency, no offer created for: {', '.join(stats['skipped'])}")
+        if stats["unknown"]:
+            lines.append(f"⚠️ couldn't find the country of {len(stats['unknown'])} companies: "
+                         f"{', '.join(sorted(stats['unknown']))}")
+        if stats["failed"]:  # ίδια μηνύματα λάθους μαζεμένα: "μήνυμα (x3)"
+            lines.append("❌ " + "; ".join(f"{m} (x{stats['failed'].count(m)})" for m in dict.fromkeys(stats["failed"])))
+        return lines or ["Nothing to do."]
+
+    @staticmethod
+    def _new_stats() -> dict:
+        return {"raised": [], "ok": 0, "created": [], "skipped": [], "failed": [], "no_competitor": set(),
+                "unknown": set()}
+
+    async def job_mu_outbid_round(self, ctx, base_url: str) -> list:
+        """
+        Εταιρείες του MU: τα skill-1 job offers γίνονται top offer των άλλων + 0.25 (μόνο ανέβασμα),
+        και όσες εταιρείες δεν έχουν skill-1 offer παίρνουν ένα καινούριο. Επιστρέφει γραμμές για το Discord.
+        """
+        driver = self.bot.browser_window
+        mu_id, my_id = await self._my_ids(base_url)
+        if not mu_id:
+            return ["ERROR: you are not in a military unit"]
+
+        # Όλα τα job offers του MU (σελίδες των 20) -> μόνο Min. Economic Skill 1, ανά εταιρεία
+        offers_by_company, page = {}, 1
+        while True:
+            await self.bot.get_content(f"{base_url}militaryUnitJobs.html?id={mu_id}&page={page}")
+            await sleep(uniform(0.3, 0.8))
+            for card in driver.find_elements(By.CSS_SELECTOR, "form.job-offer-form"):
+                text = " ".join(card.get_attribute("textContent").split())
+                salary = re.search(r"Salary: ([\d.]+) (\w+)", text)
+                skill = re.search(r"Min\. Economic Skill: (\d+)", text)
+                company = card.find_elements(By.CSS_SELECTOR, "a[href*='company.html?id=']")
+                if salary and skill and skill.group(1) == "1" and company:
+                    company_id = re.findall(r"id=(\d+)", company[0].get_attribute("href"))[0]
+                    offers_by_company.setdefault(company_id, []).append(
+                        {"offer": card.find_element(By.CSS_SELECTOR, "input[name='id']").get_attribute("value"),
+                         "salary": float(salary.group(1)), "currency": salary.group(2)})
+            if not driver.find_elements(By.CSS_SELECTOR, f"a[href*='militaryUnitJobs.html'][href*='page={page + 1}']"):
+                break
+            page += 1
+
+        # Σε ποια χώρα είναι κάθε εταιρεία (σημαία στη λίστα εταιρειών του MU: xflagsSmall-<Χώρα>)
+        await self.bot.get_content(f"{base_url}militaryUnitCompanies.html?id={mu_id}")
+        await sleep(uniform(0.3, 0.8))
+        company_country = {}
+        for row in driver.find_elements(By.XPATH, "//tr[.//a[contains(@href, 'company.html?id=')]]"):
+            link = row.find_element(By.CSS_SELECTOR, "a[href*='company.html?id=']")
+            flag = re.search(r"xflagsSmall-([\w-]+)", row.get_attribute("innerHTML"))
+            if flag:
+                company_country[re.findall(r"id=(\d+)", link.get_attribute("href"))[0]] = \
+                    self._normalize_country(flag.group(1))
+        return await self._outbid_companies(ctx, base_url, company_country, mu_id, my_id, offers_by_company)
+
+    async def job_personal_outbid_round(self, ctx, base_url: str) -> list:
+        """Όπως το job_mu_outbid_round, για τις προσωπικές σου εταιρείες (business.html?businessType=COMPANIES)."""
+        driver = self.bot.browser_window
+        mu_id, my_id = await self._my_ids(base_url)
+        await self.bot.get_content(base_url + "business.html?businessType=COMPANIES")
+        await sleep(uniform(0.3, 0.8))
+        company_country = {}
+        for row in driver.find_elements(By.CSS_SELECTOR, "#companiesOwnedBycitizenList .company-row"):
+            links = row.find_elements(By.CSS_SELECTOR, "a[href*='company.html?id=']")
+            flag = re.search(r"xflagsSmall-([\w-]+)", row.get_attribute("innerHTML"))
+            if links and flag:
+                company_country[re.findall(r"id=(\d+)", links[0].get_attribute("href"))[0]] = \
+                    self._normalize_country(flag.group(1))
+        if not company_country:
+            return ["You have no companies on this server."]
+        # τα offers κάθε εταιρείας διαβάζονται από τη σελίδα της (None = διάβασέ τα εκεί)
+        return await self._outbid_companies(ctx, base_url, company_country, mu_id, my_id, None)
+
+    async def _outbid_companies(self, ctx, base_url: str, company_country: dict, mu_id, my_id,
+                                offers_by_company: Optional[dict]) -> list:
+        """
+        Κοινό τέλος: countryIds, top offers ανά χώρα, και ανά εταιρεία ανέβασμα ή δημιουργία.
+        offers_by_company: τα skill-1 offers ανά εταιρεία αν τα ξέρουμε ήδη (MU), αλλιώς None = διάβασέ τα από
+        τη σελίδα κάθε εταιρείας (προσωπικές).
+        """
+        stats = self._new_stats()
+        country_ids = await self._country_ids(base_url)
+        company_country_id = {}
+        for company_id, name in company_country.items():
+            if country_ids.get(name):
+                company_country_id[company_id] = country_ids[name]
+            else:
+                stats["unknown"].add(company_id)
+        tops = await self._job_tops(ctx, base_url, set(company_country_id.values()), mu_id, my_id)
+
+        for company_id, country_id in company_country_id.items():
+            if utils.should_break(ctx):
+                break
+            known = offers_by_company.get(company_id, []) if offers_by_company is not None else None
+            tops_of_country = tops.get(country_id, {})
+            # MU: αν τα γνωστά offers είναι όλα ήδη πάνω από top + 0.25, δεν χρειάζεται καν να ανοίξει τη σελίδα
+            if known and all(o["currency"] in tops_of_country
+                             and o["salary"] >= round(tops_of_country[o["currency"]] + 0.25, 2) for o in known):
+                stats["ok"] += len(known)
+                continue
+            await self.bot.get_content(f"{base_url}company.html?id={company_id}")
+            await sleep(uniform(0.3, 0.8))
+            offers = known if known is not None else self._skill1_offers_on_company_page()
+            await self._outbid_on_company_page(company_id, tops_of_country, offers, stats)
+        return self._outbid_report(stats)
+
+    @staticmethod
+    async def send_lines(ctx, header: str, lines: list):
+        """Στέλνει τις γραμμές σε όσα μηνύματα χρειάζονται (το Discord δέχεται μέχρι 2000 χαρακτήρες ανά μήνυμα)."""
+        message = header
+        for line in lines:
+            line = line[:1800]  # και μία πολύ μεγάλη γραμμή να χωράει
+            if len(message) + len(line) + 1 > 1900:
+                await ctx.send(message)
+                message = header
+            message += "\n" + line
+        await ctx.send(message)
+
+    async def _run_job_outbid(self, ctx, nick: str, round_function, name: str, minutes: Optional[int]):
+        """Τρέχει έναν γύρο (minutes=None) ή γύρους κάθε ~minutes λεπτά μέχρι το .cancel."""
+        base_url = f"https://{ctx.channel.name}.e-sim.org/"
+        await ctx.send(f"**{nick}** {'Checking the job market' if minutes is None else f'Checking the job market every ~{minutes} minutes'}. "
+                       f"Cancel with `.cancel {name} {nick}`")
+        while not utils.should_break(ctx):
+            lines = await round_function(ctx, base_url)
+            await self.send_lines(ctx, f"**{nick}** Job market:", lines)
+            if minutes is None:
+                break
+            # περίμενε ~N λεπτά (±20%), ελέγχοντας για .cancel κάθε λίγο
+            wait = minutes * 60 * uniform(0.8, 1.2)
+            while wait > 0 and not utils.should_break(ctx):
+                await sleep(min(30, wait))
+                wait -= 30
+
+    @command()
+    async def job_mu_outbid(self, ctx: Context, *, nick: IsMyNick):
+        """Εταιρείες του MU σου: τα skill-1 job offers γίνονται top offer των άλλων + 0.25 (μόνο ανέβασμα),
+        σε κάθε χώρα όπου το MU έχει εταιρείες. Εταιρείες χωρίς skill-1 offer παίρνουν ένα καινούριο
+        (skill 1, top + 0.25, JOB_OFFERS_TO_CREATE θέσεις). Τα offers σου/του MU δεν μετράνε ως ανταγωνισμός.
+        Παράδειγμα: .job_mu_outbid Radical"""
+        await self._run_job_outbid(ctx, nick, self.job_mu_outbid_round, "job_mu_outbid", None)
+
+    @command()
+    async def auto_job_mu_outbid(self, ctx: Context, minutes: Optional[int] = 30, *, nick: IsMyNick):
+        """Όπως το .job_mu_outbid, ξανά κάθε ~N λεπτά (default 30) μέχρι το .cancel.
+        Παράδειγμα: .auto_job_mu_outbid 20 Radical"""
+        await self._run_job_outbid(ctx, nick, self.job_mu_outbid_round, "auto_job_mu_outbid", minutes)
+
+    @command()
+    async def job_outbid(self, ctx: Context, *, nick: IsMyNick):
+        """Οι ΠΡΟΣΩΠΙΚΕΣ σου εταιρείες (business.html?businessType=COMPANIES): ίδια λογική με το .job_mu_outbid.
+        Παράδειγμα: .job_outbid Radical"""
+        await self._run_job_outbid(ctx, nick, self.job_personal_outbid_round, "job_outbid", None)
+
+    @command()
+    async def auto_job_outbid(self, ctx: Context, minutes: Optional[int] = 30, *, nick: IsMyNick):
+        """Όπως το .job_outbid, ξανά κάθε ~N λεπτά (default 30) μέχρι το .cancel.
+        Παράδειγμα: .auto_job_outbid 20 Radical"""
+        await self._run_job_outbid(ctx, nick, self.job_personal_outbid_round, "auto_job_outbid", minutes)
 
     @command(aliases=["w", "work+"])
     async def work(self, ctx: Context, ticket_quality: Optional[int] = 5, *, nick: IsMyNick):
